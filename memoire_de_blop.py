@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# === DPI AWARENESS — DOIT ÊTRE EN TOUT PREMIER ===
+# === DPI AWARENESS - DOIT ETRE EN TOUT PREMIER ===
 import ctypes
 if hasattr(ctypes, "windll"):
     try:
@@ -19,7 +19,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Tuple, List, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageChops, ImageStat
 from pynput import mouse, keyboard
 import mss
 import ctypes as ct
@@ -128,7 +128,7 @@ def enumerate_windows_for_pids(pid_set: set) -> List[Tuple[int, str]]:
     user32.EnumWindows(enum_cb, 0)
     return results
 
-# ------------------ Grille bilinéaire ------------------
+# ------------------ Grille bilineaire ------------------
 def grid_intersections_in_quad(c1, c2, c3, c4, n, m) -> List[List[Point]]:
     x1, y1 = map(float, c1)
     x2, y2 = map(float, c2)
@@ -178,9 +178,6 @@ class QuadGridNodesApp:
         self.tile_items = {}
         self.tile_images = {}
         self.tile_border_items = {}
-        self.tile_sequences = {}
-        self.tile_animation_index: Dict[Tuple[int, int], int] = {}
-        self.animation_job: Optional[str] = None
         self.capture_executor = ThreadPoolExecutor(max_workers=CONFIG["max_capture_threads"])
         self.listener = None
         self.listener_lock = threading.Lock()
@@ -204,8 +201,13 @@ class QuadGridNodesApp:
         self.start_keyboard_listener()
         self.root.mainloop()
 
+    def _clear_root_widgets(self):
+        """Retire tout le contenu principal pour preparer une nouvelle vue."""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
     def capture_target_window_image(self) -> bool:
-        """Capture la fenêtre cible. Retourne True si la fenêtre Dofus a été capturée."""
+        """Capture la fenetre cible et renvoie True si la fenetre Dofus est trouvee."""
         hwnd = self.target_hwnd or find_window_by_title(self.target_window_title)
         if hwnd:
             rect = get_window_rect(hwnd)
@@ -218,7 +220,7 @@ class QuadGridNodesApp:
                 self.original_w, self.original_h = w, h
                 self.target_hwnd = hwnd
                 return True
-        # Fallback : écran entier
+        # Fallback : ecran entier
         raw = self.sct.grab(self.vmon)
         self.initial_img = Image.frombytes("RGB", (raw.width, raw.height), raw.rgb)
         self.target_rect = (self.vmon["left"], self.vmon["top"], self.vmon["width"], self.vmon["height"])
@@ -281,62 +283,82 @@ class QuadGridNodesApp:
         entries.sort(key=lambda e: e["title"].lower())
         return entries
 
-    def show_dofus_gate(self):
-        self.mode = "gate"
-        for widget in self.root.winfo_children():
-            widget.destroy()
+    def _pywin32_ready(self) -> bool:
+        """Indique si les dependances PyWin32 sont presentes."""
+        return not (win32gui is None or win32process is None)
+
+    def _prepare_gate_frame(self):
+        """Construit le conteneur principal de la porte Dofus."""
+        self._clear_root_widgets()
         gate_frame = tk.Frame(self.root, padx=20, pady=20)
         gate_frame.pack(fill="both", expand=True)
+        return gate_frame
 
-        if win32gui is None or win32process is None:
-            tk.Label(
-                gate_frame,
-                text="PyWin32 est requis pour détecter Dofus.",
-                font=("Arial", 12, "bold")
-            ).pack(pady=10)
-            tk.Label(
-                gate_frame,
-                text="Installez pywin32 puis relancez le programme.",
-                font=("Arial", 10)
-            ).pack(pady=5)
-            tk.Button(gate_frame, text="Fermer", command=self.on_quit).pack(pady=15)
+    def _render_gate_missing_pywin32(self, parent):
+        """Affiche l aide lorsque PyWin32 manque."""
+        tk.Label(
+            parent,
+            text="PyWin32 est requis pour détecter Dofus.",
+            font=("Arial", 12, "bold")
+        ).pack(pady=10)
+        tk.Label(
+            parent,
+            text="Installez pywin32 puis relancez le programme.",
+            font=("Arial", 10)
+        ).pack(pady=5)
+        tk.Button(parent, text="Fermer", command=self.on_quit).pack(pady=15)
+
+    def _render_gate_selection(self, parent):
+        """Affiche la liste des fenetres disponibles."""
+        tk.Label(
+            parent,
+            text="Fenêtres Dofus détectées (Release)",
+            font=("Arial", 12, "bold")
+        ).pack(pady=(0, 10))
+        self.selector_var = tk.StringVar(value=self.dofus_entries[0]["label"])
+        combo = ttk.Combobox(
+            parent,
+            textvariable=self.selector_var,
+            state="readonly",
+            values=[entry["label"] for entry in self.dofus_entries]
+        )
+        combo.pack(fill="x", padx=10, pady=5)
+
+        btn_frame = tk.Frame(parent)
+        btn_frame.pack(pady=15)
+        tk.Button(btn_frame, text="Valider", command=self.on_validate_dofus_selection).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Fermer", command=self.on_quit).pack(side="right", padx=10)
+
+    def _render_gate_retry_panel(self, parent):
+        """Affiche les actions quand aucune fenetre n est detectee."""
+        tk.Label(
+            parent,
+            text="Aucune fenêtre Dofus 'Release' détectée.",
+            font=("Arial", 12, "bold")
+        ).pack(pady=10)
+        tk.Label(
+            parent,
+            text="Connectez-vous à Dofus puis cliquez sur Réessayer.",
+            font=("Arial", 10)
+        ).pack(pady=5)
+        btn_frame = tk.Frame(parent)
+        btn_frame.pack(pady=15)
+        tk.Button(btn_frame, text="Réessayer", command=self.show_dofus_gate).pack(side="left", padx=10)
+        tk.Button(btn_frame, text="Fermer", command=self.on_quit).pack(side="right", padx=10)
+
+    def show_dofus_gate(self):
+        self.mode = "gate"
+        gate_frame = self._prepare_gate_frame()
+
+        if not self._pywin32_ready():
+            self._render_gate_missing_pywin32(gate_frame)
             return
 
         self.dofus_entries = self.scan_dofus_windows()
         if self.dofus_entries:
-            tk.Label(
-                gate_frame,
-                text="Fenêtres Dofus détectées (Release)",
-                font=("Arial", 12, "bold")
-            ).pack(pady=(0, 10))
-            self.selector_var = tk.StringVar(value=self.dofus_entries[0]["label"])
-            combo = ttk.Combobox(
-                gate_frame,
-                textvariable=self.selector_var,
-                state="readonly",
-                values=[entry["label"] for entry in self.dofus_entries]
-            )
-            combo.pack(fill="x", padx=10, pady=5)
-
-            btn_frame = tk.Frame(gate_frame)
-            btn_frame.pack(pady=15)
-            tk.Button(btn_frame, text="Valider", command=self.on_validate_dofus_selection).pack(side="left", padx=10)
-            tk.Button(btn_frame, text="Fermer", command=self.on_quit).pack(side="right", padx=10)
+            self._render_gate_selection(gate_frame)
         else:
-            tk.Label(
-                gate_frame,
-                text="Aucune fenêtre Dofus 'Release' détectée.",
-                font=("Arial", 12, "bold")
-            ).pack(pady=10)
-            tk.Label(
-                gate_frame,
-                text="Connectez-vous à Dofus puis cliquez sur Réessayer.",
-                font=("Arial", 10)
-            ).pack(pady=5)
-            btn_frame = tk.Frame(gate_frame)
-            btn_frame.pack(pady=15)
-            tk.Button(btn_frame, text="Réessayer", command=self.show_dofus_gate).pack(side="left", padx=10)
-            tk.Button(btn_frame, text="Fermer", command=self.on_quit).pack(side="right", padx=10)
+            self._render_gate_retry_panel(gate_frame)
 
     def on_validate_dofus_selection(self):
         if not self.dofus_entries or self.selector_var is None:
@@ -355,26 +377,18 @@ class QuadGridNodesApp:
         self.points = self.load_points_from_ratios(self.default_ratios)
         self.setup_start_ui()
 
-    def setup_start_ui(self):
-        self.mode = "start"
-        # Nettoyer
-        for widget in self.root.winfo_children():
-            widget.destroy()
-
-        # Calculer la taille de l'aperçu (25%)
-        scale = 0.25
+    def _create_preview_container(self, scale: float):
+        """Cree le conteneur visuel pour l apercu initial."""
         preview_w = int(self.original_w * scale)
         preview_h = int(self.original_h * scale)
-
-        # Créer un canvas ou label avec taille fixe pour éviter le noir
         self.preview_frame = tk.Frame(self.root, width=preview_w, height=preview_h, bg="black")
         self.preview_frame.pack(pady=10)
-        self.preview_frame.pack_propagate(False)  # Garde la taille même si vide
-
+        self.preview_frame.pack_propagate(False)
         self.preview_label = tk.Label(self.preview_frame, bg="black")
         self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Boutons de choix
+    def _create_start_buttons(self):
+        """Ajoute les boutons principaux de la page d accueil."""
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
         tk.Button(
@@ -386,12 +400,16 @@ class QuadGridNodesApp:
             command=self.refresh_preview_capture, font=("Arial", 10)
         ).pack(side="left", padx=10)
 
+    def _create_start_instruction(self):
+        """Affiche un rappel sur la touche F1."""
         tk.Label(
             self.root,
             text="Presser F1 pour commencer le mini-jeu et les captures.",
             font=("Arial", 10, "italic")
         ).pack(pady=(0, 10))
 
+    def _create_start_status(self):
+        """Met en place le texte de statut initial."""
         self.status = tk.Label(
             self.root,
             text=f"Cible : '{self.target_window_title}'. Aperçu à 25%.",
@@ -399,15 +417,20 @@ class QuadGridNodesApp:
         )
         self.status.pack(fill="x", pady=5)
 
-        # Charger les points par défaut
+    def setup_start_ui(self):
+        self.mode = "start"
+        self._clear_root_widgets()
+        scale = 0.25
+        self._create_preview_container(scale)
+        self._create_start_buttons()
+        self._create_start_instruction()
+        self._create_start_status()
         self.points = self.load_points_from_ratios(self.default_ratios)
-
-        # Afficher l'aperçu APRÈS que l'UI soit prête
         self.root.after(50, self._update_preview_image)
         self.root.after(150, self._place_config_window)
 
     def refresh_preview_capture(self):
-        """Reprend la capture de la fenêtre cible pour mettre à jour l'aperçu."""
+        """Reprend la capture de la fenetre cible pour mettre a jour l apercu."""
         success = self.capture_target_window_image()
         if not success:
             messagebox.showwarning(
@@ -476,11 +499,11 @@ class QuadGridNodesApp:
         resized = self.initial_img.copy().resize((new_w, new_h), Image.LANCZOS)
         draw = ImageDraw.Draw(resized)
 
-        # Convertir les points ABSOLUS en coordonnées RELATIVES à la fenêtre cible
+        # Convertir les points absolus en coordonnees relatives a la fenetre cible
         x0, y0, _, _ = self.target_rect
         relative_points = [(px - x0, py - y0) for (px, py) in self.points]
 
-        # Mettre à l'échelle pour l'aperçu
+        # Mettre a l echelle pour l apercu
         scaled_pts = [(int(rx * scale), int(ry * scale)) for (rx, ry) in relative_points]
 
         for i, (x, y) in enumerate(scaled_pts, 1):
@@ -499,7 +522,7 @@ class QuadGridNodesApp:
         self.root.update_idletasks()
         win_w = self.root.winfo_width()
         win_h = self.root.winfo_height()
-        # S'assurer qu'on ne dépasse pas
+        # Verifier que la fenetre reste visible
         if win_w > work_w:
             win_w = work_w
         if win_h > work_h:
@@ -532,8 +555,7 @@ class QuadGridNodesApp:
         if self.status is not None:
             self.status.config(text="Appuyez sur ESPACE ×4 pour redéfinir les coins.")
 
-        for widget in self.root.winfo_children():
-            widget.destroy()
+        self._clear_root_widgets()
 
         self.preview_label = tk.Label(self.root, bg="black")
         self.preview_label.pack(fill="both", expand=True)
@@ -557,9 +579,14 @@ class QuadGridNodesApp:
 
     def _enter_capture_mode(self):
         self.mode = "capture"
-        for widget in self.root.winfo_children():
-            widget.destroy()
+        self._clear_root_widgets()
+        self._build_capture_controls()
+        self._build_capture_status_label()
+        self._build_capture_body()
+        self._initialize_capture_state()
 
+    def _build_capture_controls(self):
+        """Cree la zone de saisie des parametres de grille."""
         top = tk.Frame(self.root)
         self.controls_frame = top
         top.pack(fill="x")
@@ -574,8 +601,13 @@ class QuadGridNodesApp:
         tk.Entry(top, textvariable=self.cell_var, width=6).pack(side="left", padx=5)
         tk.Button(top, text="Réinitialiser (R)", command=self.reset, font=("Arial", 10, "bold")).pack(side="right", padx=8, pady=4)
 
+    def _build_capture_status_label(self):
+        """Ajoute un rappel d etat pour le mode capture."""
         self.status = tk.Label(self.root, text="✅ Mode capture activé.", font=("Arial", 11))
         self.status.pack(fill="x", pady=3)
+
+    def _build_capture_body(self):
+        """Assemble la zone principale avec canvas et panneau lateral."""
         self.click_history.clear()
         if self.main_frame:
             self.main_frame.destroy()
@@ -590,6 +622,8 @@ class QuadGridNodesApp:
         self.side_panel.pack_propagate(False)
         self._build_side_panel()
 
+    def _initialize_capture_state(self):
+        """Lance la logique de grille apres la creation des widgets."""
         self.read_params()
         c1, c2, c3, c4 = self.points
         self.grid = grid_intersections_in_quad(c1, c2, c3, c4, self.n, self.m)
@@ -661,7 +695,7 @@ class QuadGridNodesApp:
         except: self.cell = 200
 
     def update_canvas_size(self):
-        """Redimensionne l'aire d'affichage pour rester dans la limite de 35 % de l'écran."""
+        """Redimensionne la zone d affichage pour rester dans la limite de 35 pourcent de l ecran."""
         if not self.canvas:
             return
         self.read_params()
@@ -706,8 +740,6 @@ class QuadGridNodesApp:
 
     def reset(self):
         self.clear_click_history()
-        self._stop_animation_loop()
-        self.tile_sequences.clear()
         for d in (self.tile_items, self.tile_border_items):
             for item in list(d.values()):
                 self.canvas.delete(item)
@@ -739,7 +771,6 @@ class QuadGridNodesApp:
             return
         self._quitting = True
         self.stop_global_listener()
-        self._stop_animation_loop()
         if hasattr(self, "capture_executor") and self.capture_executor is not None:
             try:
                 self.capture_executor.shutdown(wait=False, cancel_futures=True)
@@ -792,6 +823,47 @@ class QuadGridNodesApp:
         except RuntimeError:
             pass
 
+    def _crop_reference_tile(self, monitor) -> Optional[Image.Image]:
+        """Extrait la zone de reference correspondant au snapshot."""
+        if self.reference_img is None or not hasattr(self, "target_rect"):
+            return None
+        x0, y0, _, _ = self.target_rect
+        left = int(monitor["left"] - x0)
+        top = int(monitor["top"] - y0)
+        right = left + monitor["width"]
+        bottom = top + monitor["height"]
+        img_w, img_h = self.reference_img.size
+        if left < 0 or top < 0 or right > img_w or bottom > img_h:
+            return None
+        return self.reference_img.crop((left, top, right, bottom))
+
+    def _difference_score(self, frame: Image.Image, reference: Image.Image) -> float:
+        """Calcule l ecart moyen entre deux zones."""
+        if frame.size != reference.size:
+            reference = reference.resize(frame.size, Image.BILINEAR)
+        diff = ImageChops.difference(frame, reference)
+        stats = ImageStat.Stat(diff)
+        frame_gray = frame.convert("L")
+        ref_gray = reference.convert("L")
+        brightness_diff = abs(ImageStat.Stat(frame_gray).mean[0] - ImageStat.Stat(ref_gray).mean[0])
+        return sum(stats.mean) - brightness_diff * 1.5
+
+    def _select_most_different_frame(self, frames: List[Image.Image], monitor) -> Optional[Image.Image]:
+        """Choisit l image la plus differente du reference screen."""
+        if not frames:
+            return None
+        ref_crop = self._crop_reference_tile(monitor)
+        if ref_crop is None:
+            return frames[0]
+        best_frame = frames[0]
+        best_score = self._difference_score(best_frame, ref_crop)
+        for frame in frames[1:]:
+            score = self._difference_score(frame, ref_crop)
+            if score > best_score:
+                best_frame = frame
+                best_score = score
+        return best_frame
+
     def _capture_sequence_for_tile(self, coord, monitor, px, py):
         frames: List[Image.Image] = []
         local_sct = mss.mss()
@@ -807,28 +879,29 @@ class QuadGridNodesApp:
                 local_sct.close()
             except Exception:
                 pass
+        best_frame = self._select_most_different_frame(frames, monitor)
+        if best_frame is None:
+            return
         try:
-            self.root.after(0, lambda: self._apply_tile_sequence(coord, frames, px, py))
+            self.root.after(0, lambda: self._apply_tile_snapshot(coord, best_frame, px, py))
         except tk.TclError:
             return
 
-    def _apply_tile_sequence(self, coord, frames, px, py):
-        if not frames or not self.canvas:
+    def _apply_tile_snapshot(self, coord, frame, px, py):
+        if frame is None or not self.canvas:
             return
         j, i = coord
         display_size = max(1, int(self.display_cell))
-        photos = [ImageTk.PhotoImage(frame.resize((display_size, display_size), Image.LANCZOS)) for frame in frames]
-        self.tile_sequences[coord] = photos
-        self.tile_images[coord] = photos
-        self.tile_animation_index[coord] = 0
+        photo = ImageTk.PhotoImage(frame.resize((display_size, display_size), Image.LANCZOS))
+        self.tile_images[coord] = photo
 
         cx = i * self.display_cell + self.display_cell // 2
         cy = j * self.display_cell + self.display_cell // 2
         if coord in self.tile_items:
             self.canvas.coords(self.tile_items[coord], cx, cy)
-            self.canvas.itemconfig(self.tile_items[coord], image=photos[0])
+            self.canvas.itemconfig(self.tile_items[coord], image=photo)
         else:
-            self.tile_items[coord] = self.canvas.create_image(cx, cy, image=photos[0])
+            self.tile_items[coord] = self.canvas.create_image(cx, cy, image=photo)
 
         rect_coords = (
             i * self.display_cell, j * self.display_cell,
@@ -846,49 +919,12 @@ class QuadGridNodesApp:
             "coord": coord,
             "relative_point": rel_point,
             "timestamp": time.strftime("%H:%M:%S"),
-            "frames": frames
+            "frame": frame
         }
         self.click_history.append(snapshot_data)
         self.update_click_map_preview()
         if self.status:
-            self.status.config(text=f"Série capturée pour ({j},{i})")
-        self._ensure_animation_loop()
-
-    def _ensure_animation_loop(self):
-        if self.animation_job is not None or not self.root:
-            return
-        interval_ms = max(10, int(CONFIG["animation_interval"] * 1000))
-        self.animation_job = self.root.after(interval_ms, self._animation_loop)
-
-    def _animation_loop(self):
-        if not self.canvas:
-            self._stop_animation_loop()
-            return
-        interval_ms = max(10, int(CONFIG["animation_interval"] * 1000))
-        active = False
-        for coord, frames in list(self.tile_sequences.items()):
-            if not frames or coord not in self.tile_items:
-                continue
-            active = True
-            idx = self.tile_animation_index.get(coord, 0) % len(frames)
-            self.canvas.itemconfig(self.tile_items[coord], image=frames[idx])
-            self.tile_animation_index[coord] = (idx + 1) % len(frames)
-        if active:
-            try:
-                self.animation_job = self.root.after(interval_ms, self._animation_loop)
-            except tk.TclError:
-                self.animation_job = None
-        else:
-            self.animation_job = None
-
-    def _stop_animation_loop(self):
-        if self.animation_job is not None:
-            try:
-                self.root.after_cancel(self.animation_job)
-            except tk.TclError:
-                pass
-            self.animation_job = None
-        self.tile_animation_index.clear()
+            self.status.config(text=f"Snapshot retenu pour ({j},{i})")
 
 if __name__ == "__main__":
     QuadGridNodesApp()
