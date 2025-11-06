@@ -191,6 +191,9 @@ class QuadGridNodesApp:
         self.controls_frame = None
         self.selector_var: Optional[tk.StringVar] = None
         self.dofus_entries: List[Dict[str, object]] = []
+        self.reference_img: Optional[Image.Image] = None
+        self._capture_start_pending = False
+        self._f1_origin_mode: Optional[str] = None
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
@@ -353,6 +356,7 @@ class QuadGridNodesApp:
         self.setup_start_ui()
 
     def setup_start_ui(self):
+        self.mode = "start"
         # Nettoyer
         for widget in self.root.winfo_children():
             widget.destroy()
@@ -374,13 +378,19 @@ class QuadGridNodesApp:
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
         tk.Button(
-            btn_frame, text="✅ Utiliser configuration par défaut",
-            command=self.use_default_config, font=("Arial", 10, "bold")
-        ).pack(side="left", padx=10)
-        tk.Button(
             btn_frame, text="🔧 Configurer les 4 points",
             command=self.enter_config_mode, font=("Arial", 10)
-        ).pack(side="right", padx=10)
+        ).pack(side="left", padx=10)
+        tk.Button(
+            btn_frame, text="Nouv. aperçu",
+            command=self.refresh_preview_capture, font=("Arial", 10)
+        ).pack(side="left", padx=10)
+
+        tk.Label(
+            self.root,
+            text="Presser F1 pour commencer le mini-jeu et les captures.",
+            font=("Arial", 10, "italic")
+        ).pack(pady=(0, 10))
 
         self.status = tk.Label(
             self.root,
@@ -395,6 +405,61 @@ class QuadGridNodesApp:
         # Afficher l'aperçu APRÈS que l'UI soit prête
         self.root.after(50, self._update_preview_image)
         self.root.after(150, self._place_config_window)
+
+    def refresh_preview_capture(self):
+        """Reprend la capture de la fenêtre cible pour mettre à jour l'aperçu."""
+        success = self.capture_target_window_image()
+        if not success:
+            messagebox.showwarning(
+                "Capture",
+                "Impossible de retrouver la fenêtre sélectionnée, capture de l'écran complet utilisée."
+            )
+
+        if hasattr(self, "preview_frame") and self.preview_frame is not None:
+            scale = 0.25
+            self.preview_frame.config(
+                width=int(self.original_w * scale),
+                height=int(self.original_h * scale)
+            )
+
+        self._update_preview_image()
+        if self.status is not None:
+            self.status.config(text=f"Cible : '{self.target_window_title}'. Aperçu rafraîchi.")
+
+    def on_f1(self, event=None):
+        if self._capture_start_pending:
+            return
+        if self.mode not in ("start", "config"):
+            return
+        if self.mode == "config" and self._next_point_index < 4:
+            if self.status is not None:
+                self.status.config(text="Définissez d'abord les 4 coins (ESPACE ×4) avant de presser F1.")
+            return
+        self._capture_start_pending = True
+        self._f1_origin_mode = self.mode
+        if self.status is not None:
+            self.status.config(text="F1 détecté. Capture de référence dans 0.5s…")
+        self.root.after(500, self._start_capture_after_f1)
+
+    def _start_capture_after_f1(self):
+        origin_mode = self._f1_origin_mode or "start"
+        self._capture_start_pending = False
+        self._f1_origin_mode = None
+        if self._quitting:
+            return
+        success = self.capture_target_window_image()
+        if not success:
+            messagebox.showwarning(
+                "Capture",
+                "Fenêtre Dofus introuvable, capture de l'écran complet utilisée."
+            )
+        if hasattr(self, "initial_img") and self.initial_img is not None:
+            self.reference_img = self.initial_img.copy()
+        else:
+            self.reference_img = None
+        if origin_mode == "config":
+            self._next_point_index = 4
+        self._enter_capture_mode()
 
 
     def _update_preview_image(self):
@@ -460,15 +525,12 @@ class QuadGridNodesApp:
         if y < 0: y = 0
         self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
 
-    def use_default_config(self):
-        self.points = self.load_points_from_ratios(self.default_ratios)
-        self._enter_capture_mode()
-
     def enter_config_mode(self):
         self.mode = "config"
         self._next_point_index = 0
         self.points = self.load_points_from_ratios(self.default_ratios)
-        self.status.config(text="Appuyez sur ESPACE ×4 pour redéfinir les coins.")
+        if self.status is not None:
+            self.status.config(text="Appuyez sur ESPACE ×4 pour redéfinir les coins.")
 
         for widget in self.root.winfo_children():
             widget.destroy()
@@ -478,10 +540,9 @@ class QuadGridNodesApp:
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
-        tk.Button(btn_frame, text="✅ Confirmer", command=self.confirm_config, font=("Arial", 10, "bold")).pack(side="left", padx=10)
-        tk.Button(btn_frame, text="🔄 Recharger par défaut", command=self.reload_default_for_config, font=("Arial", 10)).pack(side="right", padx=10)
+        tk.Button(btn_frame, text="🔄 Recharger par défaut", command=self.reload_default_for_config, font=("Arial", 10)).pack(side="left", padx=10)
 
-        self.status = tk.Label(self.root, text="Appuyez sur ESPACE ×4...", font=("Arial", 10))
+        self.status = tk.Label(self.root, text="Appuyez sur ESPACE ×4 puis sur F1 pour lancer les captures.", font=("Arial", 10))
         self.status.pack(fill="x", pady=5)
 
         self._update_preview_image()
@@ -490,14 +551,9 @@ class QuadGridNodesApp:
     def reload_default_for_config(self):
         self.points = self.load_points_from_ratios(self.default_ratios)
         self._next_point_index = 0
-        self.status.config(text="Configuration réinitialisée. Appuyez sur ESPACE ×4.")
+        if self.status is not None:
+            self.status.config(text="Configuration réinitialisée. Appuyez sur ESPACE ×4 puis F1.")
         self._update_preview_image()
-
-    def confirm_config(self):
-        if len(self.points) != 4:
-            messagebox.showwarning("Erreur", "4 points requis.")
-            return
-        self._enter_capture_mode()
 
     def _enter_capture_mode(self):
         self.mode = "capture"
@@ -646,7 +702,7 @@ class QuadGridNodesApp:
         if self._next_point_index < 4:
             self.status.config(text=f"Coin {self._next_point_index} défini. Encore {4 - self._next_point_index} × ESPACE…")
         else:
-            self.status.config(text="✅ 4 coins définis. Cliquez sur Confirmer.")
+            self.status.config(text="✅ 4 coins définis. Pressez F1 pour démarrer les captures.")
 
     def reset(self):
         self.clear_click_history()
@@ -667,6 +723,8 @@ class QuadGridNodesApp:
                     self.on_quit()
                 elif key == keyboard.Key.space:
                     self.on_space()
+                elif key == keyboard.Key.f1:
+                    self.on_f1()
                 elif hasattr(key, "char") and key.char and key.char.lower() == "r":
                     if self.mode == "capture":
                         self.reset()
