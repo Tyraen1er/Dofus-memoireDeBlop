@@ -3,3 +3,5 @@ pillow
 pynput
 psutil
 pywin32; platform_system == "Windows"
+numpy
+opencv-python

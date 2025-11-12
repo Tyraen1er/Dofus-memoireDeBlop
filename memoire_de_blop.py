@@ -27,6 +27,9 @@ from ctypes import wintypes
 import time
 import psutil
 import sys
+from pathlib import Path
+import numpy as np
+import cv2
 try:
     import win32gui
     import win32process
@@ -49,6 +52,11 @@ CONFIG = {
     "canvas_horizontal_padding": 20,
     "canvas_vertical_padding": 40,
 }
+
+if CONFIG["capture_frames"] > 1:
+    CONFIG["capture_interval"] = 1.0 / (CONFIG["capture_frames"] - 1)
+else:
+    CONFIG["capture_interval"] = 0.0
 
 # === API Windows ===
 if IS_WINDOWS and hasattr(ct, "windll"):
@@ -194,6 +202,7 @@ class QuadGridNodesApp:
         self._borderless = False
         self.last_click_point: Optional[Tuple[int, int]] = None
         self.grid: Optional[List[List[Point]]] = None
+        self.debug_enabled = any(arg.lower() == "debug=true" for arg in sys.argv[1:])
         self.capture_executor = ThreadPoolExecutor(max_workers=CONFIG["max_capture_threads"])
         self.listener = None
         self.listener_lock = threading.Lock()
@@ -209,10 +218,19 @@ class QuadGridNodesApp:
         self._f1_origin_mode: Optional[str] = None
         self._resize_job = None
         self._selection_pending = False
+        self.snapshot_series_dir: Optional[Path] = None
+        self.root_dir = Path(__file__).resolve().parent
+        self.log_file_path = self.root_dir / "log.txt"
+        self.log_file = None
+        self.orb = None
+        self.bf_matcher = None
+        self.orb_references: List[Dict[str, object]] = []
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
         self.pixel_ratio = self._detect_pixel_ratio()
+        self._initialize_debug_logger()
+        self._initialize_orb_pipeline()
 
         self.show_dofus_gate()
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
@@ -234,6 +252,45 @@ class QuadGridNodesApp:
             # Renforce le mode topmost après le changement de style de la fenêtre.
             self.root.wm_attributes("-topmost", True)
         except tk.TclError:
+            pass
+
+    def _initialize_debug_logger(self):
+        if not self.debug_enabled:
+            self.log_file = None
+            return
+        try:
+            self.log_file_path.parent.mkdir(exist_ok=True)
+            self.log_file = open(self.log_file_path, "a", encoding="utf-8")
+            header = f"\n===== Session {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+            self.log_file.write(header)
+            self.log_file.flush()
+        except Exception as exc:
+            self.log_file = None
+            print(f"[DEBUG] Impossible d'ouvrir {self.log_file_path}: {exc}")
+            self.debug_enabled = False
+
+    def _debug_log(self, message):
+        if not self.debug_enabled:
+            return
+        try:
+            if callable(message):
+                message = message()
+        except Exception:
+            return
+        if message is None:
+            return
+        entry = f"[{time.strftime('%H:%M:%S')}] {message}\n"
+        if self.log_file:
+            try:
+                self.log_file.write(entry)
+                self.log_file.flush()
+                return
+            except Exception:
+                pass
+        try:
+            with self.log_file_path.open("a", encoding="utf-8") as fallback:
+                fallback.write(entry)
+        except Exception:
             pass
 
     def capture_target_window_image(self) -> bool:
@@ -503,6 +560,7 @@ class QuadGridNodesApp:
     def on_f1(self, event=None):
         if self.mode == "capture":
             self.reset()
+            self._prepare_snapshot_series_dir()
             if self.status:
                 self.status.config(text="Snapshots effacés (F1).")
             return
@@ -538,6 +596,7 @@ class QuadGridNodesApp:
             self.reference_img = None
         if origin_mode == "config":
             self._next_point_index = 4
+        self._prepare_snapshot_series_dir()
         self._enter_capture_mode()
 
 
@@ -855,6 +914,12 @@ class QuadGridNodesApp:
             except TypeError:
                 self.capture_executor.shutdown(wait=False)
             self.capture_executor = None
+        if getattr(self, "log_file", None):
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
         try: self.kb_listener.stop()
         except: pass
         self.root.destroy()
@@ -897,6 +962,7 @@ class QuadGridNodesApp:
             "height": self.cell
         }
         coord = (j, i)
+        self._debug_log(lambda: f"[CAPTURE] Demande snapshot coord={coord} center=({px},{py}) monitor={monitor}")
         if self.status:
             self.status.config(text=f"Capture en cours pour ({j},{i})…")
         if not hasattr(self, "capture_executor") or self.capture_executor is None:
@@ -904,22 +970,13 @@ class QuadGridNodesApp:
         try:
             self.capture_executor.submit(self._capture_sequence_for_tile, coord, monitor, px, py)
         except RuntimeError:
+            self._debug_log("[CAPTURE] Soumission thread impossible (RuntimeError)")
             pass
 
     def _crop_reference_tile(self, monitor) -> Optional[Image.Image]:
         """Extrait la zone de reference correspondant au snapshot."""
         if self.reference_img is None or not hasattr(self, "target_rect"):
             return None
-        x0, y0, _, _ = self.target_rect
-        left = int(monitor["left"] - x0)
-        top = int(monitor["top"] - y0)
-        right = left + monitor["width"]
-        bottom = top + monitor["height"]
-        img_w, img_h = self.reference_img.size
-        if left < 0 or top < 0 or right > img_w or bottom > img_h:
-            return None
-        return self.reference_img.crop((left, top, right, bottom))
-
         x0, y0, _, _ = self.target_rect
         left = int(monitor["left"] - x0)
         top = int(monitor["top"] - y0)
@@ -941,12 +998,130 @@ class QuadGridNodesApp:
         brightness_diff = abs(ImageStat.Stat(frame_gray).mean[0] - ImageStat.Stat(ref_gray).mean[0])
         return sum(stats.mean) - brightness_diff * 1.5
 
+    def _initialize_orb_pipeline(self):
+        try:
+            self.orb = cv2.ORB_create(nfeatures=500)
+            self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        except Exception as exc:
+            self.orb = None
+            self.bf_matcher = None
+            self._debug_log(lambda: f"[ORB] Initialisation impossible: {exc}")
+        self._load_orb_reference_library()
+
+    def _load_orb_reference_library(self):
+        self.orb_references = []
+        if not self.orb:
+            return
+        ref_dir = self.root_dir / "Ref_blop"
+        if not ref_dir.exists():
+            return
+        for image_path in sorted(ref_dir.glob("*")):
+            if not image_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+                continue
+            try:
+                with Image.open(image_path) as img:
+                    pil_img = img.convert("RGB")
+            except Exception:
+                continue
+            descriptors = self._compute_orb_descriptors(pil_img)
+            if descriptors is None:
+                continue
+            self.orb_references.append({
+                "name": image_path.stem,
+                "path": image_path,
+                "image": pil_img,
+                "descriptors": descriptors
+            })
+        self._debug_log(lambda: f"[ORB] Références chargées: {len(self.orb_references)}")
+
+    def _compute_orb_descriptors(self, image: Image.Image) -> Optional[np.ndarray]:
+        if not self.orb or image is None:
+            return None
+        try:
+            rgb = image.convert("RGB")
+            arr = np.array(rgb)
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            _, descriptors = self.orb.detectAndCompute(gray, None)
+            if descriptors is None or len(descriptors) == 0:
+                return None
+            return descriptors
+        except Exception as exc:
+            self._debug_log(lambda: f"[ORB] Extraction impossible: {exc}")
+            return None
+
+    def _orb_match_score(self, frame: Image.Image, reference):
+        """Retourne un score de similarite ORB entre 0 et 1 (1 = meilleur match)."""
+        if not self.bf_matcher:
+            return None
+        ref_image = reference
+        ref_desc = None
+        if isinstance(reference, dict):
+            ref_desc = reference.get("descriptors")
+            ref_image = reference.get("image")
+        frame_desc = self._compute_orb_descriptors(frame)
+        if frame_desc is None:
+            return None
+        if ref_desc is None:
+            ref_desc = self._compute_orb_descriptors(ref_image)
+        if ref_desc is None:
+            return None
+        try:
+            matches = self.bf_matcher.match(frame_desc, ref_desc)
+        except Exception as exc:
+            self._debug_log(lambda: f"[ORB] BFMatcher erreur: {exc}")
+            return None
+        if not matches:
+            return None
+        avg_distance = sum(m.distance for m in matches) / (len(matches) * 256.0)
+        overlap = len(matches) / max(len(frame_desc), len(ref_desc))
+        score = max(0.0, min(1.0, overlap * (1.0 - avg_distance)))
+        return score
+
+    def _evaluate_orb_score_for_frame(self, frame: Image.Image):
+        if not self.orb_references:
+            return None, None
+        best_score = None
+        best_ref = None
+        for ref_entry in self.orb_references:
+            score = self._orb_match_score(frame, ref_entry)
+            if score is None:
+                continue
+            if best_score is None or score > best_score:
+                best_score = score
+                best_ref = ref_entry
+        return best_score, best_ref
+
     def _select_most_different_frame(self, frames: List[Image.Image], monitor) -> Optional[Image.Image]:
-        """Choisit l image la plus differente du reference screen."""
+        """Choisit la frame la plus similaire selon ORB (fallback difference)."""
         if not frames:
             return None
+        self._debug_log(lambda: f"[CAPTURE] Sélection parmi {len(frames)} frames")
+        best_frame = None
+        best_orb_score = -1.0
+        orb_enabled = bool(self.orb and self.bf_matcher and self.orb_references)
+        if orb_enabled:
+            for idx, frame in enumerate(frames):
+                try:
+                    score, ref_entry = self._evaluate_orb_score_for_frame(frame)
+                except Exception as exc:
+                    self._debug_log(lambda e=exc, i=idx: f"[ORB] Exception frame {i}: {e}")
+                    score, ref_entry = None, None
+                ref_name = ref_entry["name"] if ref_entry else "N/A"
+                if score is not None:
+                    self._debug_log(lambda s=score, n=ref_name, i=idx: f"[ORB] Frame {i} ↔ {n} => {s:.3f}")
+                    if score > best_orb_score:
+                        best_orb_score = score
+                        best_frame = frame
+                else:
+                    self._debug_log(lambda n=ref_name, i=idx: f"[ORB] Frame {i} ↔ {n} => score indisponible")
+            if best_frame is not None:
+                self._debug_log(lambda: f"[CAPTURE] Frame retenue par ORB avec score {best_orb_score:.3f}")
+                return best_frame
+            else:
+                self._debug_log("[ORB] Aucun score valide, utilisation du fallback différentiel.")
         ref_crop = self._crop_reference_tile(monitor)
         if ref_crop is None:
+            self._debug_log("[CAPTURE] ref_crop introuvable, sélection default frame[0]")
             return frames[0]
         best_frame = frames[0]
         best_score = self._difference_score(best_frame, ref_crop)
@@ -955,12 +1130,15 @@ class QuadGridNodesApp:
             if score > best_score:
                 best_frame = frame
                 best_score = score
+        self._debug_log(lambda: f"[CAPTURE] Frame retenue par fallback score={best_score:.2f}")
         return best_frame
 
     def _capture_sequence_for_tile(self, coord, monitor, px, py):
         frames: List[Image.Image] = []
         local_sct = mss.mss()
+        self._debug_log(lambda: f"[CAPTURE] Thread démarré pour {coord}, monitor={monitor}")
         try:
+            time.sleep(0.1)
             for idx in range(CONFIG["capture_frames"]):
                 raw = local_sct.grab(monitor)
                 img = Image.frombytes("RGB", (raw.width, raw.height), raw.rgb)
@@ -974,18 +1152,24 @@ class QuadGridNodesApp:
                 pass
         best_frame = self._select_most_different_frame(frames, monitor)
         if best_frame is None:
+            self._debug_log(lambda: f"[CAPTURE] Aucune frame retenue pour {coord}")
             return
         try:
             self.root.after(0, lambda: self._apply_tile_snapshot(coord, best_frame, px, py))
         except tk.TclError:
+            self._debug_log(lambda: f"[CAPTURE] root.after échoue pour {coord}")
             return
 
     def _apply_tile_snapshot(self, coord, frame, px, py):
         if frame is None or not self.canvas or self.mode != "capture":
+            self._debug_log(lambda: f"[CAPTURE] _apply_tile_snapshot ignoré, frame/canvas/mode invalide pour {coord}")
             return
         j, i = coord
+        snapshot_index = len(self.click_history) + 1
+        self._persist_snapshot_image(frame, snapshot_index, j, i)
         self.tile_frames[coord] = frame.copy()
         self._render_tile_image(coord, frame)
+        self._debug_log(lambda: f"[CAPTURE] Snapshot appliqué coord={coord}, index={snapshot_index}")
 
         target_rect = getattr(self, "target_rect", (self.vmon["left"], self.vmon["top"], self.vmon["width"], self.vmon["height"]))
         rel_point = (int(px - target_rect[0]), int(py - target_rect[1]))
@@ -1000,6 +1184,35 @@ class QuadGridNodesApp:
         self.update_click_map_preview()
         if self.status:
             self.status.config(text=f"Snapshot retenu pour ({j},{i})")
+
+    def _prepare_snapshot_series_dir(self):
+        base_dir = self.root_dir / "snapshots"
+        try:
+            base_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        series_dir = base_dir / timestamp
+        suffix = 1
+        while series_dir.exists():
+            suffix += 1
+            series_dir = base_dir / f"{timestamp}_{suffix:02d}"
+        try:
+            series_dir.mkdir(parents=True, exist_ok=False)
+            self.snapshot_series_dir = series_dir
+        except Exception as exc:
+            self._debug_log(lambda: f"[Snapshots] Impossible de créer le dossier: {exc}")
+            self.snapshot_series_dir = None
+
+    def _persist_snapshot_image(self, frame: Image.Image, snapshot_index: int, row: int, col: int):
+        if not self.snapshot_series_dir:
+            return
+        filename = f"{snapshot_index:02d}_r{row}_c{col}.png"
+        path = self.snapshot_series_dir / filename
+        try:
+            frame.save(path)
+        except Exception as exc:
+            self._debug_log(lambda: f"[Snapshots] Sauvegarde impossible pour {path}: {exc}")
 
     def return_to_config_from_capture(self):
         if self.mode != "capture":
