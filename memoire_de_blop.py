@@ -178,6 +178,11 @@ class QuadGridNodesApp:
         self.tile_items = {}
         self.tile_images = {}
         self.tile_border_items = {}
+        self.tile_frames = {}
+        self.param_labels: Dict[str, tk.Label] = {}
+        self._borderless = False
+        self.last_click_point: Optional[Tuple[int, int]] = None
+        self.grid: Optional[List[List[Point]]] = None
         self.capture_executor = ThreadPoolExecutor(max_workers=CONFIG["max_capture_threads"])
         self.listener = None
         self.listener_lock = threading.Lock()
@@ -205,6 +210,17 @@ class QuadGridNodesApp:
         """Retire tout le contenu principal pour preparer une nouvelle vue."""
         for widget in self.root.winfo_children():
             widget.destroy()
+
+    def _set_borderless(self, enabled: bool):
+        if self._borderless == enabled:
+            return
+        self._borderless = enabled
+        try:
+            self.root.overrideredirect(1 if enabled else 0)
+            # Renforce le mode topmost après le changement de style de la fenêtre.
+            self.root.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
 
     def capture_target_window_image(self) -> bool:
         """Capture la fenetre cible et renvoie True si la fenetre Dofus est trouvee."""
@@ -348,6 +364,7 @@ class QuadGridNodesApp:
 
     def show_dofus_gate(self):
         self.mode = "gate"
+        self._set_borderless(False)
         gate_frame = self._prepare_gate_frame()
 
         if not self._pywin32_ready():
@@ -393,7 +410,7 @@ class QuadGridNodesApp:
         btn_frame.pack(pady=10)
         tk.Button(
             btn_frame, text="🔧 Configurer les 4 points",
-            command=self.enter_config_mode, font=("Arial", 10)
+            command=lambda: self.enter_config_mode(), font=("Arial", 10)
         ).pack(side="left", padx=10)
         tk.Button(
             btn_frame, text="Nouv. aperçu",
@@ -417,15 +434,27 @@ class QuadGridNodesApp:
         )
         self.status.pack(fill="x", pady=5)
 
-    def setup_start_ui(self):
+    def setup_start_ui(self, preserve_points: bool = False):
         self.mode = "start"
+        self._set_borderless(False)
+        self.stop_global_listener()
         self._clear_root_widgets()
+        self.controls_frame = None
+        self.main_frame = None
+        self.side_panel = None
+        self.canvas = None
+        self.click_map_label = None
+        self.param_labels = {}
+        self.last_click_point = None
+        self.grid = None
+
         scale = 0.25
         self._create_preview_container(scale)
         self._create_start_buttons()
         self._create_start_instruction()
         self._create_start_status()
-        self.points = self.load_points_from_ratios(self.default_ratios)
+        if not preserve_points or len(self.points) != 4:
+            self.points = self.load_points_from_ratios(self.default_ratios)
         self.root.after(50, self._update_preview_image)
         self.root.after(150, self._place_config_window)
 
@@ -450,6 +479,11 @@ class QuadGridNodesApp:
             self.status.config(text=f"Cible : '{self.target_window_title}'. Aperçu rafraîchi.")
 
     def on_f1(self, event=None):
+        if self.mode == "capture":
+            self.reset()
+            if self.status:
+                self.status.config(text="Snapshots effacés (F1).")
+            return
         if self._capture_start_pending:
             return
         if self.mode not in ("start", "config"):
@@ -513,6 +547,22 @@ class QuadGridNodesApp:
         if len(scaled_pts) == 4:
             draw.polygon(scaled_pts, outline="red", width=2)
 
+        if self.mode == "config" and self.last_click_point is not None:
+            lx, ly = self.last_click_point
+            rel_x = lx - x0
+            rel_y = ly - y0
+            if 0 <= rel_x <= img_w and 0 <= rel_y <= img_h:
+                half = self.cell / 2.0
+                left = (rel_x - half) * scale
+                top = (rel_y - half) * scale
+                right = (rel_x + half) * scale
+                bottom = (rel_y + half) * scale
+                left = max(0, min(new_w - 1, int(left)))
+                top = max(0, min(new_h - 1, int(top)))
+                right = max(left + 1, min(new_w, int(right)))
+                bottom = max(top + 1, min(new_h, int(bottom)))
+                draw.rectangle((left, top, right, bottom), outline="#00aaff", width=2)
+
         tk_img = ImageTk.PhotoImage(resized)
         self.preview_label.config(image=tk_img)
         self.preview_label.image = tk_img  # keep reference
@@ -548,63 +598,71 @@ class QuadGridNodesApp:
         if y < 0: y = 0
         self.root.geometry(f"{win_w}x{win_h}+{x}+{y}")
 
-    def enter_config_mode(self):
+    def enter_config_mode(self, preserve_points: bool = False):
         self.mode = "config"
-        self._next_point_index = 0
-        self.points = self.load_points_from_ratios(self.default_ratios)
+        self._set_borderless(False)
+        if not preserve_points or len(self.points) != 4:
+            self.points = self.load_points_from_ratios(self.default_ratios)
+            self._next_point_index = 0
+        else:
+            self._next_point_index = 4
         if self.status is not None:
-            self.status.config(text="Appuyez sur ESPACE ×4 pour redéfinir les coins.")
+            if self._next_point_index < 4:
+                self.status.config(text="Appuyez sur ESPACE ×4 pour redéfinir les coins.")
+            else:
+                self.status.config(text="Coins conservés. Pressez F1 pour relancer les captures.")
 
         self._clear_root_widgets()
+        self.controls_frame = None
+        self.main_frame = None
+        self.side_panel = None
+        self.canvas = None
+        self.click_map_label = None
+        self.param_labels = {}
+        self.last_click_point = None
+        self.grid = None
+
+        ctrl_frame = tk.Frame(self.root)
+        ctrl_frame.pack(pady=8)
+        self._create_param_control(ctrl_frame, "n", "Lignes", step=1, minimum=1)
+        self._create_param_control(ctrl_frame, "m", "Colonnes", step=1, minimum=1)
+        self._create_param_control(ctrl_frame, "cell", "Taille (px)", step=10, minimum=30, maximum=600)
 
         self.preview_label = tk.Label(self.root, bg="black")
         self.preview_label.pack(fill="both", expand=True)
+        self.preview_label.bind("<Button-1>", self._on_local_config_click)
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="🔄 Recharger par défaut", command=self.reload_default_for_config, font=("Arial", 10)).pack(side="left", padx=10)
 
-        self.status = tk.Label(self.root, text="Appuyez sur ESPACE ×4 puis sur F1 pour lancer les captures.", font=("Arial", 10))
+        default_status = "Appuyez sur ESPACE ×4 puis sur F1 pour lancer les captures."
+        if self._next_point_index >= 4:
+            default_status = "Coins conservés. Pressez F1 pour relancer les captures."
+        self.status = tk.Label(self.root, text=default_status, font=("Arial", 10))
         self.status.pack(fill="x", pady=5)
 
         self._update_preview_image()
         self.root.after(100, self._place_config_window)
+        self.start_global_listener()
 
     def reload_default_for_config(self):
         self.points = self.load_points_from_ratios(self.default_ratios)
         self._next_point_index = 0
+        self.last_click_point = None
         if self.status is not None:
             self.status.config(text="Configuration réinitialisée. Appuyez sur ESPACE ×4 puis F1.")
         self._update_preview_image()
 
     def _enter_capture_mode(self):
         self.mode = "capture"
+        self._set_borderless(True)
         self._clear_root_widgets()
-        self._build_capture_controls()
-        self._build_capture_status_label()
+        self.controls_frame = None
+        self.param_labels = {}
+        self.status = None
         self._build_capture_body()
         self._initialize_capture_state()
-
-    def _build_capture_controls(self):
-        """Cree la zone de saisie des parametres de grille."""
-        top = tk.Frame(self.root)
-        self.controls_frame = top
-        top.pack(fill="x")
-        tk.Label(top, text="n:", font=("Arial", 12, "bold")).pack(side="left")
-        self.n_var = tk.StringVar(value=str(self.n))
-        tk.Entry(top, textvariable=self.n_var, width=4).pack(side="left", padx=5)
-        tk.Label(top, text="m:", font=("Arial", 12, "bold")).pack(side="left")
-        self.m_var = tk.StringVar(value=str(self.m))
-        tk.Entry(top, textvariable=self.m_var, width=4).pack(side="left", padx=5)
-        tk.Label(top, text="Taille(px):", font=("Arial", 12, "bold")).pack(side="left")
-        self.cell_var = tk.StringVar(value=str(self.cell))
-        tk.Entry(top, textvariable=self.cell_var, width=6).pack(side="left", padx=5)
-        tk.Button(top, text="Réinitialiser (R)", command=self.reset, font=("Arial", 10, "bold")).pack(side="right", padx=8, pady=4)
-
-    def _build_capture_status_label(self):
-        """Ajoute un rappel d etat pour le mode capture."""
-        self.status = tk.Label(self.root, text="✅ Mode capture activé.", font=("Arial", 11))
-        self.status.pack(fill="x", pady=3)
 
     def _build_capture_body(self):
         """Assemble la zone principale avec canvas et panneau lateral."""
@@ -615,12 +673,10 @@ class QuadGridNodesApp:
         self.main_frame.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(self.main_frame, bg="#111", highlightthickness=0)
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.pack(fill="both", expand=True)
 
-        self.side_panel = tk.Frame(self.main_frame, width=260, bg="#1b1b1b")
-        self.side_panel.pack(side="right", fill="y")
-        self.side_panel.pack_propagate(False)
-        self._build_side_panel()
+        self.side_panel = None
+        self.click_map_label = None
 
     def _initialize_capture_state(self):
         """Lance la logique de grille apres la creation des widgets."""
@@ -630,29 +686,6 @@ class QuadGridNodesApp:
         self.update_canvas_size()
         self.start_global_listener()
         self.root.after(100, self._place_memory_window)
-
-    def _build_side_panel(self):
-        if not self.side_panel:
-            return
-        for child in self.side_panel.winfo_children():
-            child.destroy()
-        tk.Label(
-            self.side_panel,
-            text="Aperçu des zones cliquées",
-            fg="#f2f2f2",
-            bg="#1b1b1b",
-            font=("Arial", 11, "bold")
-        ).pack(anchor="w", padx=8, pady=(10, 4))
-
-        self.click_map_label = tk.Label(
-            self.side_panel,
-            bg="#1b1b1b",
-            fg="#dddddd",
-            text="Aucun clic pour l'instant",
-            wraplength=210,
-            justify="center"
-        )
-        self.click_map_label.pack(fill="x", padx=8, pady=(4, 10))
 
     def clear_click_history(self):
         self.click_history.clear()
@@ -687,12 +720,18 @@ class QuadGridNodesApp:
         self.click_map_label.image = tk_img
 
     def read_params(self):
-        try: self.n = max(1, int(self.n_var.get()))
-        except: self.n = 3
-        try: self.m = max(1, int(self.m_var.get()))
-        except: self.m = 5
-        try: self.cell = max(10, int(self.cell_var.get()))
-        except: self.cell = 200
+        try:
+            self.n = max(1, int(self.n))
+        except Exception:
+            self.n = 3
+        try:
+            self.m = max(1, int(self.m))
+        except Exception:
+            self.m = 5
+        try:
+            self.cell = max(10, int(self.cell))
+        except Exception:
+            self.cell = 200
 
     def update_canvas_size(self):
         """Redimensionne la zone d affichage pour rester dans la limite de 35 pourcent de l ecran."""
@@ -725,6 +764,7 @@ class QuadGridNodesApp:
         canvas_h = self.display_cell * (self.n + 1)
         self.canvas.config(width=canvas_w, height=canvas_h)
         self.canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
+        self._redraw_tiles()
 
     def on_space(self, event=None):
         if self.mode != "config" or self._next_point_index >= 4:
@@ -738,14 +778,19 @@ class QuadGridNodesApp:
         else:
             self.status.config(text="✅ 4 coins définis. Pressez F1 pour démarrer les captures.")
 
-    def reset(self):
+    def reset(self, update_status: bool = True):
         self.clear_click_history()
-        for d in (self.tile_items, self.tile_border_items):
-            for item in list(d.values()):
-                self.canvas.delete(item)
-            d.clear()
+        if self.canvas:
+            for d in (self.tile_items, self.tile_border_items):
+                for item in list(d.values()):
+                    self.canvas.delete(item)
+                d.clear()
+        else:
+            self.tile_items.clear()
+            self.tile_border_items.clear()
         self.tile_images.clear()
-        if self.status:
+        self.tile_frames.clear()
+        if update_status and self.status:
             self.status.config(text="Snapshots effacés.")
 
     def start_keyboard_listener(self):
@@ -759,7 +804,7 @@ class QuadGridNodesApp:
                     self.on_f1()
                 elif hasattr(key, "char") and key.char and key.char.lower() == "r":
                     if self.mode == "capture":
-                        self.reset()
+                        self.return_to_config_from_capture()
             except: pass
         listener = keyboard.Listener(on_press=on_press)
         listener.daemon = True
@@ -796,7 +841,12 @@ class QuadGridNodesApp:
                 self.listener = None
 
     def on_global_click(self, x, y, button, pressed):
-        if not pressed or str(button) != "Button.left" or self.grid is None:
+        if not pressed or str(button) != "Button.left":
+            return
+        if self.mode == "config":
+            self.root.after(0, lambda: self._record_config_click(x, y))
+            return
+        if self.grid is None:
             return
         self.root.after(200, lambda: self.update_tile_from_intersection(x, y))
 
@@ -888,11 +938,53 @@ class QuadGridNodesApp:
             return
 
     def _apply_tile_snapshot(self, coord, frame, px, py):
-        if frame is None or not self.canvas:
+        if frame is None or not self.canvas or self.mode != "capture":
+            return
+        j, i = coord
+        self.tile_frames[coord] = frame.copy()
+        self._render_tile_image(coord, frame)
+
+        target_rect = getattr(self, "target_rect", (self.vmon["left"], self.vmon["top"], self.vmon["width"], self.vmon["height"]))
+        rel_point = (int(px - target_rect[0]), int(py - target_rect[1]))
+        snapshot_data = {
+            "index": len(self.click_history) + 1,
+            "coord": coord,
+            "relative_point": rel_point,
+            "timestamp": time.strftime("%H:%M:%S"),
+            "frame": frame
+        }
+        self.click_history.append(snapshot_data)
+        self.update_click_map_preview()
+        if self.status:
+            self.status.config(text=f"Snapshot retenu pour ({j},{i})")
+
+    def return_to_config_from_capture(self):
+        if self.mode != "capture":
+            return
+        self.stop_global_listener()
+        self.reset(update_status=False)
+        self.enter_config_mode(preserve_points=True)
+
+    def _record_config_click(self, x, y):
+        if self.mode != "config":
+            return
+        px, py = self._logical_to_physical_point((x, y))
+        self.last_click_point = (px, py)
+        self._update_preview_image()
+
+    def _on_local_config_click(self, event):
+        if self.mode != "config":
+            return
+        self.last_click_point = self._logical_to_physical_point((event.x_root, event.y_root))
+        self._update_preview_image()
+
+    def _render_tile_image(self, coord, frame):
+        if not self.canvas:
             return
         j, i = coord
         display_size = max(1, int(self.display_cell))
-        photo = ImageTk.PhotoImage(frame.resize((display_size, display_size), Image.LANCZOS))
+        resized = frame.resize((display_size, display_size), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(resized)
         self.tile_images[coord] = photo
 
         cx = i * self.display_cell + self.display_cell // 2
@@ -912,19 +1004,63 @@ class QuadGridNodesApp:
         else:
             self.tile_border_items[coord] = self.canvas.create_rectangle(*rect_coords, outline="#ff3366", width=2)
 
-        target_rect = getattr(self, "target_rect", (self.vmon["left"], self.vmon["top"], self.vmon["width"], self.vmon["height"]))
-        rel_point = (int(px - target_rect[0]), int(py - target_rect[1]))
-        snapshot_data = {
-            "index": len(self.click_history) + 1,
-            "coord": coord,
-            "relative_point": rel_point,
-            "timestamp": time.strftime("%H:%M:%S"),
-            "frame": frame
-        }
-        self.click_history.append(snapshot_data)
-        self.update_click_map_preview()
-        if self.status:
-            self.status.config(text=f"Snapshot retenu pour ({j},{i})")
+    def _redraw_tiles(self):
+        if not self.canvas or not self.tile_frames:
+            return
+        for coord, frame in self.tile_frames.items():
+            self._render_tile_image(coord, frame)
+
+    def _create_param_control(self, parent, key, label_text, step=1, minimum=1, maximum=None):
+        container = tk.Frame(parent)
+        container.pack(side="left", padx=6, pady=4)
+        tk.Label(container, text=label_text + " :", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 4))
+        tk.Button(
+            container, text="-", width=2,
+            command=lambda: self._adjust_param(key, -step, minimum, maximum)
+        ).pack(side="left")
+        value_label = tk.Label(container, text=str(getattr(self, key)), width=4, font=("Arial", 11))
+        value_label.pack(side="left", padx=3)
+        tk.Button(
+            container, text="+", width=2,
+            command=lambda: self._adjust_param(key, step, minimum, maximum)
+        ).pack(side="left")
+        self.param_labels[key] = value_label
+
+    def _adjust_param(self, key, delta, minimum, maximum):
+        current_value = getattr(self, key)
+        new_value = current_value + delta
+        if key == "cell":
+            minimum = max(minimum, 10)
+        if maximum is not None:
+            new_value = max(minimum, min(new_value, maximum))
+        else:
+            new_value = max(minimum, new_value)
+        if new_value == current_value:
+            return
+        setattr(self, key, new_value)
+        self.read_params()
+        self._refresh_param_label(key)
+        if key in ("n", "m"):
+            self._rebuild_grid()
+        if self.mode == "capture":
+            self.reset()
+            if self.canvas:
+                self.update_canvas_size()
+            if self.status:
+                labels = {"n": "n", "m": "m", "cell": "Taille (px)"}
+                self.status.config(text=f"{labels.get(key, key)} = {new_value}. Snapshots effacés.")
+        else:
+            if key == "cell":
+                self._update_preview_image()
+
+    def _refresh_param_label(self, key):
+        if key in self.param_labels:
+            self.param_labels[key].config(text=str(getattr(self, key)))
+
+    def _rebuild_grid(self):
+        if len(self.points) == 4:
+            c1, c2, c3, c4 = self.points
+            self.grid = grid_intersections_in_quad(c1, c2, c3, c4, self.n, self.m)
 
 if __name__ == "__main__":
     QuadGridNodesApp()
