@@ -656,6 +656,12 @@ class QuadGridNodesApp:
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
+        tk.Button(
+            btn_frame,
+            text="Nouv. aperçu",
+            command=self.refresh_preview_capture,
+            font=("Arial", 10)
+        ).pack(side="left", padx=10)
         tk.Button(btn_frame, text="🔄 Recharger par défaut", command=self.reload_default_for_config, font=("Arial", 10)).pack(side="left", padx=10)
 
         default_status = "Appuyez sur ESPACE ×4 puis sur F1 pour lancer les captures."
