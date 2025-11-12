@@ -196,6 +196,7 @@ class QuadGridNodesApp:
         self.reference_img: Optional[Image.Image] = None
         self._capture_start_pending = False
         self._f1_origin_mode: Optional[str] = None
+        self._resize_job = None
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
@@ -203,6 +204,7 @@ class QuadGridNodesApp:
 
         self.show_dofus_gate()
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
+        self.root.bind("<Configure>", self._on_root_configure)
         self.start_keyboard_listener()
         self.root.mainloop()
 
@@ -656,7 +658,8 @@ class QuadGridNodesApp:
 
     def _enter_capture_mode(self):
         self.mode = "capture"
-        self._set_borderless(True)
+        self._set_borderless(False)
+        self.root.resizable(True, True)
         self._clear_root_widgets()
         self.controls_frame = None
         self.param_labels = {}
@@ -734,12 +737,16 @@ class QuadGridNodesApp:
             self.cell = 200
 
     def update_canvas_size(self):
-        """Redimensionne la zone d affichage pour rester dans la limite de 35 pourcent de l ecran."""
+        """Adapte la zone d affichage a la taille courante de la fenetre."""
         if not self.canvas:
             return
         self.read_params()
         self.root.update_idletasks()
-        max_win_w, max_win_h = self._memory_window_limits()
+        win_w = max(1, self.root.winfo_width())
+        win_h = max(1, self.root.winfo_height())
+        if win_w <= 1 or win_h <= 1:
+            win_w = max(1, self.root.winfo_reqwidth())
+            win_h = max(1, self.root.winfo_reqheight())
 
         side_panel_w = 0
         if self.side_panel:
@@ -753,8 +760,8 @@ class QuadGridNodesApp:
 
         horizontal_padding = CONFIG["canvas_horizontal_padding"]
         vertical_padding = CONFIG["canvas_vertical_padding"]
-        available_w = max(1, max_win_w - side_panel_w - horizontal_padding)
-        available_h = max(1, max_win_h - controls_h - status_h - vertical_padding)
+        available_w = max(1, win_w - side_panel_w - horizontal_padding)
+        available_h = max(1, win_h - controls_h - status_h - vertical_padding)
 
         width_based = max(1, available_w // max(1, (self.m + 1)))
         height_based = max(1, available_h // max(1, (self.n + 1)))
@@ -1061,6 +1068,17 @@ class QuadGridNodesApp:
         if len(self.points) == 4:
             c1, c2, c3, c4 = self.points
             self.grid = grid_intersections_in_quad(c1, c2, c3, c4, self.n, self.m)
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root or self.mode != "capture":
+            return
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(120, self._apply_resize_update)
+
+    def _apply_resize_update(self):
+        self._resize_job = None
+        self.update_canvas_size()
 
 if __name__ == "__main__":
     QuadGridNodesApp()
