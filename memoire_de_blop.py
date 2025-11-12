@@ -128,6 +128,17 @@ def enumerate_windows_for_pids(pid_set: set) -> List[Tuple[int, str]]:
     user32.EnumWindows(enum_cb, 0)
     return results
 
+def focus_window(hwnd: int) -> bool:
+    if not IS_WINDOWS or user32 is None or not hwnd:
+        return False
+    try:
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
 # ------------------ Grille bilineaire ------------------
 def grid_intersections_in_quad(c1, c2, c3, c4, n, m) -> List[List[Point]]:
     x1, y1 = map(float, c1)
@@ -197,6 +208,7 @@ class QuadGridNodesApp:
         self._capture_start_pending = False
         self._f1_origin_mode: Optional[str] = None
         self._resize_job = None
+        self._selection_pending = False
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
@@ -382,6 +394,8 @@ class QuadGridNodesApp:
     def on_validate_dofus_selection(self):
         if not self.dofus_entries or self.selector_var is None:
             return
+        if self._selection_pending:
+            return
         label = self.selector_var.get()
         entry = next((e for e in self.dofus_entries if e["label"] == label), None)
         if not entry:
@@ -389,6 +403,12 @@ class QuadGridNodesApp:
             return
         self.target_hwnd = entry["hwnd"]
         self.target_window_title = entry["title"]
+        focus_window(self.target_hwnd)
+        self._selection_pending = True
+        self.root.after(500, self._complete_selection_after_focus)
+
+    def _complete_selection_after_focus(self):
+        self._selection_pending = False
         if not self.capture_target_window_image():
             messagebox.showerror("Capture", "Impossible de capturer la fenêtre sélectionnée.")
             self.show_dofus_gate()
@@ -884,6 +904,16 @@ class QuadGridNodesApp:
         """Extrait la zone de reference correspondant au snapshot."""
         if self.reference_img is None or not hasattr(self, "target_rect"):
             return None
+        x0, y0, _, _ = self.target_rect
+        left = int(monitor["left"] - x0)
+        top = int(monitor["top"] - y0)
+        right = left + monitor["width"]
+        bottom = top + monitor["height"]
+        img_w, img_h = self.reference_img.size
+        if left < 0 or top < 0 or right > img_w or bottom > img_h:
+            return None
+        return self.reference_img.crop((left, top, right, bottom))
+
         x0, y0, _, _ = self.target_rect
         left = int(monitor["left"] - x0)
         top = int(monitor["top"] - y0)
