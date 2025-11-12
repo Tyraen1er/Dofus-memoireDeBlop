@@ -1,0 +1,4 @@
+# Dossiers à ignorer
+snapshots/
+__pycache__/
+log.txt
