@@ -45,7 +45,7 @@ IS_LINUX = sys.platform.startswith("linux")
 
 CONFIG = {
     "memory_window_ratio": 0.35,
-    "capture_frames": 10,
+    "capture_frames": 20,
     "capture_interval": 0.2,
     "animation_interval": 0.2,
     "max_capture_threads": 3,
@@ -57,6 +57,8 @@ if CONFIG["capture_frames"] > 1:
     CONFIG["capture_interval"] = 1.0 / (CONFIG["capture_frames"] - 1)
 else:
     CONFIG["capture_interval"] = 0.0
+
+COLOR_HIST_BINS = 36
 
 # === API Windows ===
 if IS_WINDOWS and hasattr(ct, "windll"):
@@ -198,6 +200,8 @@ class QuadGridNodesApp:
         self.tile_images = {}
         self.tile_border_items = {}
         self.tile_frames = {}
+        self.tile_text_items = {}
+        self.tile_classification: Dict[Tuple[int, int], Dict[str, object]] = {}
         self.param_labels: Dict[str, tk.Label] = {}
         self._borderless = False
         self.last_click_point: Optional[Tuple[int, int]] = None
@@ -225,12 +229,14 @@ class QuadGridNodesApp:
         self.orb = None
         self.bf_matcher = None
         self.orb_references: List[Dict[str, object]] = []
+        self.color_references: List[Dict[str, object]] = []
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
         self.pixel_ratio = self._detect_pixel_ratio()
         self._initialize_debug_logger()
         self._initialize_orb_pipeline()
+        self._load_color_reference_library()
 
         self.show_dofus_gate()
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
@@ -561,8 +567,9 @@ class QuadGridNodesApp:
         if self.mode == "capture":
             self.reset()
             self._prepare_snapshot_series_dir()
+            self._capture_reference_board(warn_on_failure=True)
             if self.status:
-                self.status.config(text="Snapshots effacés (F1).")
+                self.status.config(text="Snapshots effacés et référence rafraîchie (F1).")
             return
         if self._capture_start_pending:
             return
@@ -584,8 +591,15 @@ class QuadGridNodesApp:
         self._f1_origin_mode = None
         if self._quitting:
             return
+        self._capture_reference_board(warn_on_failure=True)
+        if origin_mode == "config":
+            self._next_point_index = 4
+        self._prepare_snapshot_series_dir()
+        self._enter_capture_mode()
+
+    def _capture_reference_board(self, warn_on_failure: bool = False) -> bool:
         success = self.capture_target_window_image()
-        if not success:
+        if not success and warn_on_failure:
             messagebox.showwarning(
                 "Capture",
                 "Fenêtre Dofus introuvable, capture de l'écran complet utilisée."
@@ -594,10 +608,7 @@ class QuadGridNodesApp:
             self.reference_img = self.initial_img.copy()
         else:
             self.reference_img = None
-        if origin_mode == "config":
-            self._next_point_index = 4
-        self._prepare_snapshot_series_dir()
-        self._enter_capture_mode()
+        return success
 
 
     def _update_preview_image(self):
@@ -755,6 +766,12 @@ class QuadGridNodesApp:
     def _build_capture_body(self):
         """Assemble la zone principale avec canvas et panneau lateral."""
         self.click_history.clear()
+        self.tile_classification.clear()
+        self.tile_text_items.clear()
+        self.tile_items.clear()
+        self.tile_border_items.clear()
+        self.tile_frames.clear()
+        self.tile_images.clear()
         if self.main_frame:
             self.main_frame.destroy()
         self.main_frame = tk.Frame(self.root)
@@ -873,15 +890,17 @@ class QuadGridNodesApp:
     def reset(self, update_status: bool = True):
         self.clear_click_history()
         if self.canvas:
-            for d in (self.tile_items, self.tile_border_items):
+            for d in (self.tile_items, self.tile_border_items, self.tile_text_items):
                 for item in list(d.values()):
                     self.canvas.delete(item)
                 d.clear()
         else:
             self.tile_items.clear()
             self.tile_border_items.clear()
+            self.tile_text_items.clear()
         self.tile_images.clear()
         self.tile_frames.clear()
+        self.tile_classification.clear()
         if update_status and self.status:
             self.status.config(text="Snapshots effacés.")
 
@@ -1015,24 +1034,107 @@ class QuadGridNodesApp:
         ref_dir = self.root_dir / "Ref_blop"
         if not ref_dir.exists():
             return
-        for image_path in sorted(ref_dir.glob("*")):
-            if not image_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
-                continue
-            try:
-                with Image.open(image_path) as img:
-                    pil_img = img.convert("RGB")
-            except Exception:
-                continue
-            descriptors = self._compute_orb_descriptors(pil_img)
-            if descriptors is None:
-                continue
-            self.orb_references.append({
-                "name": image_path.stem,
-                "path": image_path,
-                "image": pil_img,
-                "descriptors": descriptors
-            })
+        search_dirs = []
+        taille_dir = ref_dir / "taille"
+        if taille_dir.exists():
+            search_dirs.append(taille_dir)
+        else:
+            search_dirs.append(ref_dir)
+        for base_dir in search_dirs:
+            for image_path in sorted(base_dir.glob("*")):
+                if not image_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
+                    continue
+                try:
+                    with Image.open(image_path) as img:
+                        pil_img = img.convert("RGB")
+                except Exception:
+                    continue
+                descriptors = self._compute_orb_descriptors(pil_img)
+                if descriptors is None:
+                    continue
+                self.orb_references.append({
+                    "name": image_path.stem,
+                    "path": image_path,
+                    "image": pil_img,
+                    "descriptors": descriptors
+                })
         self._debug_log(lambda: f"[ORB] Références chargées: {len(self.orb_references)}")
+
+    def _load_color_reference_library(self):
+        self.color_references = []
+        color_dirs = []
+        for base_name in ("Ref_blop", "Ref_clop"):
+            candidate = self.root_dir / base_name / "couleur"
+            if candidate.exists():
+                color_dirs.append(candidate)
+        if not color_dirs:
+            return
+        for color_dir in color_dirs:
+            for image_path in sorted(color_dir.glob("*")):
+                if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+                    continue
+                try:
+                    with Image.open(image_path) as img:
+                        rgba = img.convert("RGBA")
+                except Exception:
+                    continue
+                hist = self._compute_reference_color_histogram(rgba)
+                if hist is None:
+                    continue
+                normalized = self._normalize_color_label(image_path.stem)
+                display = self._format_color_display(normalized or image_path.stem)
+                letter = self._letter_for_color(normalized)
+                self.color_references.append({
+                    "name": image_path.stem,
+                    "path": image_path,
+                    "hist": hist,
+                    "label": normalized,
+                    "display": display,
+                "letter": letter
+            })
+        self._debug_log(lambda: f"[COLOR] Références chargées: {len(self.color_references)}")
+
+    def _compute_reference_color_histogram(self, image: Image.Image):
+        if image is None:
+            return None
+        rgba = image.convert("RGBA")
+        arr = np.array(rgba)
+        if arr.size == 0:
+            return None
+        rgb = arr[..., :3]
+        alpha = arr[..., 3]
+        mask = alpha > 25
+        return self._build_color_histogram_from_rgb(rgb, mask)
+
+    def _build_color_histogram_from_rgb(self, rgb_array: np.ndarray, mask=None):
+        if rgb_array.size == 0:
+            return None
+        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV)
+        return self._build_hue_histogram_from_hsv(hsv, mask)
+
+    def _build_hue_histogram_from_hsv(self, hsv_array: np.ndarray, mask=None):
+        if hsv_array.size == 0:
+            return None
+        hue = hsv_array[..., 0]
+        if mask is not None:
+            mask_flat = mask.reshape(-1).astype(bool)
+            hue_flat = hue.reshape(-1)
+            if np.any(mask_flat):
+                hue_values = hue_flat[mask_flat]
+            else:
+                hue_values = hue_flat
+        else:
+            hue_values = hue.reshape(-1)
+        if hue_values.size == 0:
+            hue_values = hue.reshape(-1)
+        hist, _ = np.histogram(hue_values, bins=COLOR_HIST_BINS, range=(0, 180))
+        hist = hist.astype(np.float32)
+        total = hist.sum()
+        if total > 0:
+            hist /= total
+        else:
+            hist.fill(1.0 / COLOR_HIST_BINS)
+        return hist
 
     def _compute_orb_descriptors(self, image: Image.Image) -> Optional[np.ndarray]:
         if not self.orb or image is None:
@@ -1091,14 +1193,203 @@ class QuadGridNodesApp:
                 best_ref = ref_entry
         return best_score, best_ref
 
-    def _select_most_different_frame(self, frames: List[Image.Image], monitor) -> Optional[Image.Image]:
-        """Choisit la frame la plus similaire selon ORB (fallback difference)."""
-        if not frames:
+    def _normalize_blop_label(self, raw_name: str) -> str:
+        if not raw_name:
+            return ""
+        label = raw_name.lower()
+        for prefix in ("ref_blop_", "ref_", "blop_"):
+            if label.startswith(prefix):
+                label = label[len(prefix):]
+                break
+        label = label.replace("blop", "")
+        return label.strip("_- ")
+
+    def _format_blop_display(self, label_key: str) -> str:
+        if not label_key:
+            return "Type inconnu"
+        normalized = label_key.lower()
+        mapping = {
+            "grand": "Blop grand",
+            "moyen": "Blop moyen",
+            "petit": "Blop petit"
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        return f"Blop {label_key.capitalize()}"
+
+    def _letter_for_label(self, label_key: str) -> str:
+        if not label_key:
+            return "?"
+        normalized = label_key.lower()
+        mapping = {"grand": "G", "moyen": "M", "petit": "P"}
+        if normalized in mapping:
+            return mapping[normalized]
+        return label_key[:1].upper()
+
+    def _normalize_color_label(self, raw_name: str) -> str:
+        if not raw_name:
+            return ""
+        label = raw_name.lower()
+        for prefix in ("ref_blop_", "ref_", "color_", "couleur_", "blop_"):
+            if label.startswith(prefix):
+                label = label[len(prefix):]
+                break
+        label = label.replace("couleur", "")
+        label = label.strip("_- ")
+        if "-" in label:
+            label = label.split("-")[0]
+        return label.strip("_- ")
+
+    def _format_color_display(self, label_key: str) -> str:
+        if not label_key:
+            return "Couleur inconnue"
+        normalized = label_key.lower()
+        mapping = {
+            "bleu": "Couleur Bleu Indigo",
+            "rouge": "Couleur Rouge Griotte",
+            "vert": "Couleur Vert Reinette",
+            "jaune": "Couleur Jaune Coco"
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        return f"Couleur {label_key.replace('-', ' ').title()}"
+
+    def _letter_for_color(self, label_key: str) -> str:
+        if not label_key:
+            return "?"
+        normalized = label_key.lower()
+        mapping = {"bleu": "B", "rouge": "R", "vert": "V", "jaune": "J"}
+        if normalized in mapping:
+            return mapping[normalized]
+        return label_key[:1].upper()
+
+    def _aggregate_classification_votes(self, frame_votes: List[Dict[str, object]]):
+        if not frame_votes:
             return None
+        totals: Dict[str, float] = {}
+        for vote in frame_votes:
+            label = str(vote.get("label", "")).strip().lower()
+            if not label:
+                continue
+            score = float(vote.get("score", 0.0))
+            totals[label] = totals.get(label, 0.0) + score
+        if not totals:
+            return None
+        best_label, best_score = max(totals.items(), key=lambda item: item[1])
+        total_score = sum(totals.values())
+        confidence = best_score / total_score if total_score > 0 else 0.0
+        return {
+            "label": best_label,
+            "display": self._format_blop_display(best_label),
+            "letter": self._letter_for_label(best_label),
+            "confidence": confidence,
+            "votes": totals,
+            "frame_votes": frame_votes,
+            "total_score": total_score
+        }
+
+    def _compose_classification_result(self, size_data: Optional[Dict[str, object]], color_data: Optional[Dict[str, object]]):
+        if not size_data and not color_data:
+            return None
+        combined: Dict[str, object] = dict(size_data) if size_data else {}
+        if color_data:
+            combined["color"] = color_data
+            combined["color_score"] = color_data.get("score")
+        size_letter = ""
+        if size_data:
+            size_letter = size_data.get("letter") or self._letter_for_label(size_data.get("label"))
+        color_letter = color_data.get("letter") if color_data else ""
+        letters = "".join(filter(None, [size_letter, color_letter]))
+        if letters:
+            combined["letter"] = letters
+        display_parts: List[str] = []
+        if size_data:
+            display_parts.append(size_data.get("display") or self._format_blop_display(size_data.get("label")))
+        if color_data:
+            display_parts.append(color_data.get("display") or self._format_color_display(color_data.get("label")))
+        if display_parts:
+            combined["display"] = " — ".join(part for part in display_parts if part)
+        elif size_data and size_data.get("display"):
+            combined["display"] = size_data.get("display")
+        elif color_data and color_data.get("display"):
+            combined["display"] = color_data.get("display")
+        return combined
+
+    def _extract_frame_color_histogram(self, frame: Image.Image, reference: Optional[Image.Image] = None):
+        if frame is None:
+            return None
+        rgb = np.array(frame.convert("RGB"))
+        if rgb.size == 0:
+            return None
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        sat_mask = hsv[..., 1] > 40
+        val_mask = hsv[..., 2] > 50
+        mask = sat_mask & val_mask
+        if reference is not None:
+            ref_rgb = np.array(reference.convert("RGB"))
+            if ref_rgb.shape[:2] != rgb.shape[:2]:
+                ref_rgb = cv2.resize(ref_rgb, (rgb.shape[1], rgb.shape[0]))
+            diff = cv2.absdiff(rgb, ref_rgb)
+            diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+            diff_mask = diff_gray > 20
+            if np.any(diff_mask):
+                mask = mask & diff_mask
+                if not np.any(mask):
+                    mask = diff_mask
+        hist = self._build_hue_histogram_from_hsv(hsv, mask)
+        mask_size = mask.size if hasattr(mask, "size") else hsv[..., 0].size
+        coverage = float(mask.sum()) / mask_size if mask_size else 0.0
+        return {"hist": hist, "coverage": coverage}
+
+    def _color_hist_similarity(self, hist_a, hist_b):
+        if hist_a is None or hist_b is None:
+            return 0.0
+        a = np.asarray(hist_a, dtype=np.float32)
+        b = np.asarray(hist_b, dtype=np.float32)
+        if a.size == 0 or b.size == 0:
+            return 0.0
+        bc = float(np.sum(np.sqrt(np.clip(a, 0.0, 1.0) * np.clip(b, 0.0, 1.0))))
+        return max(0.0, min(1.0, bc))
+
+    def _classify_color_from_frame(self, frame: Image.Image, reference: Optional[Image.Image] = None):
+        if not self.color_references:
+            return None
+        signature = self._extract_frame_color_histogram(frame, reference)
+        if not signature:
+            return None
+        hist = signature.get("hist")
+        if hist is None:
+            return None
+        best_entry = None
+        best_score = -1.0
+        for ref in self.color_references:
+            score = self._color_hist_similarity(hist, ref.get("hist"))
+            if score > best_score:
+                best_score = score
+                best_entry = ref
+        if not best_entry:
+            return None
+        normalized = best_entry.get("label") or self._normalize_color_label(best_entry.get("name"))
+        return {
+            "label": normalized,
+            "raw_label": best_entry.get("name"),
+            "display": best_entry.get("display") or self._format_color_display(normalized),
+            "letter": best_entry.get("letter") or self._letter_for_color(normalized),
+            "score": best_score,
+            "coverage": signature.get("coverage")
+        }
+
+    def _select_most_different_frame(self, frames: List[Image.Image], monitor):
+        """Choisit la frame retenue et calcule le vote blop correspondant."""
+        if not frames:
+            return None, None
         self._debug_log(lambda: f"[CAPTURE] Sélection parmi {len(frames)} frames")
         best_frame = None
         best_orb_score = -1.0
+        classification = None
         orb_enabled = bool(self.orb and self.bf_matcher and self.orb_references)
+        ref_crop = self._crop_reference_tile(monitor)
+        frame_votes: List[Dict[str, object]] = []
         if orb_enabled:
             for idx, frame in enumerate(frames):
                 try:
@@ -1109,20 +1400,33 @@ class QuadGridNodesApp:
                 ref_name = ref_entry["name"] if ref_entry else "N/A"
                 if score is not None:
                     self._debug_log(lambda s=score, n=ref_name, i=idx: f"[ORB] Frame {i} ↔ {n} => {s:.3f}")
+                    normalized = self._normalize_blop_label(ref_name)
+                    if normalized:
+                        frame_votes.append({
+                            "index": idx + 1,
+                            "label": normalized,
+                            "raw_label": ref_name,
+                            "score": score
+                        })
                     if score > best_orb_score:
                         best_orb_score = score
                         best_frame = frame
                 else:
                     self._debug_log(lambda n=ref_name, i=idx: f"[ORB] Frame {i} ↔ {n} => score indisponible")
+            classification = self._aggregate_classification_votes(frame_votes)
             if best_frame is not None:
+                color_vote = self._classify_color_from_frame(best_frame, ref_crop)
+                classification = self._compose_classification_result(classification, color_vote)
                 self._debug_log(lambda: f"[CAPTURE] Frame retenue par ORB avec score {best_orb_score:.3f}")
-                return best_frame
+                return best_frame, classification
             else:
                 self._debug_log("[ORB] Aucun score valide, utilisation du fallback différentiel.")
-        ref_crop = self._crop_reference_tile(monitor)
         if ref_crop is None:
             self._debug_log("[CAPTURE] ref_crop introuvable, sélection default frame[0]")
-            return frames[0]
+            default_frame = frames[0]
+            color_vote = self._classify_color_from_frame(default_frame, ref_crop)
+            classification = self._compose_classification_result(classification, color_vote)
+            return default_frame, classification
         best_frame = frames[0]
         best_score = self._difference_score(best_frame, ref_crop)
         for frame in frames[1:]:
@@ -1131,7 +1435,9 @@ class QuadGridNodesApp:
                 best_frame = frame
                 best_score = score
         self._debug_log(lambda: f"[CAPTURE] Frame retenue par fallback score={best_score:.2f}")
-        return best_frame
+        color_vote = self._classify_color_from_frame(best_frame, ref_crop)
+        classification = self._compose_classification_result(classification, color_vote)
+        return best_frame, classification
 
     def _capture_sequence_for_tile(self, coord, monitor, px, py):
         frames: List[Image.Image] = []
@@ -1150,17 +1456,17 @@ class QuadGridNodesApp:
                 local_sct.close()
             except Exception:
                 pass
-        best_frame = self._select_most_different_frame(frames, monitor)
+        best_frame, classification = self._select_most_different_frame(frames, monitor)
         if best_frame is None:
             self._debug_log(lambda: f"[CAPTURE] Aucune frame retenue pour {coord}")
             return
         try:
-            self.root.after(0, lambda: self._apply_tile_snapshot(coord, best_frame, px, py))
+            self.root.after(0, lambda: self._apply_tile_snapshot(coord, best_frame, px, py, classification))
         except tk.TclError:
             self._debug_log(lambda: f"[CAPTURE] root.after échoue pour {coord}")
             return
 
-    def _apply_tile_snapshot(self, coord, frame, px, py):
+    def _apply_tile_snapshot(self, coord, frame, px, py, classification=None):
         if frame is None or not self.canvas or self.mode != "capture":
             self._debug_log(lambda: f"[CAPTURE] _apply_tile_snapshot ignoré, frame/canvas/mode invalide pour {coord}")
             return
@@ -1168,6 +1474,10 @@ class QuadGridNodesApp:
         snapshot_index = len(self.click_history) + 1
         self._persist_snapshot_image(frame, snapshot_index, j, i)
         self.tile_frames[coord] = frame.copy()
+        if classification:
+            self.tile_classification[coord] = classification
+        elif coord in self.tile_classification:
+            self.tile_classification.pop(coord, None)
         self._render_tile_image(coord, frame)
         self._debug_log(lambda: f"[CAPTURE] Snapshot appliqué coord={coord}, index={snapshot_index}")
 
@@ -1178,12 +1488,20 @@ class QuadGridNodesApp:
             "coord": coord,
             "relative_point": rel_point,
             "timestamp": time.strftime("%H:%M:%S"),
-            "frame": frame
+            "frame": frame,
+            "classification": classification
         }
         self.click_history.append(snapshot_data)
         self.update_click_map_preview()
         if self.status:
-            self.status.config(text=f"Snapshot retenu pour ({j},{i})")
+            status_msg = f"Snapshot retenu pour ({j},{i})"
+            if classification and classification.get("display"):
+                conf = classification.get("confidence")
+                if conf is not None:
+                    status_msg += f" — {classification['display']} ({conf * 100:.0f}%)"
+                else:
+                    status_msg += f" — {classification['display']}"
+            self.status.config(text=status_msg)
 
     def _prepare_snapshot_series_dir(self):
         base_dir = self.root_dir / "snapshots"
@@ -1259,6 +1577,32 @@ class QuadGridNodesApp:
             self.canvas.coords(self.tile_border_items[coord], *rect_coords)
         else:
             self.tile_border_items[coord] = self.canvas.create_rectangle(*rect_coords, outline="#ff3366", width=2)
+
+        label_data = self.tile_classification.get(coord)
+        existing_label_item = self.tile_text_items.get(coord)
+        if label_data and self.canvas:
+            label_text = label_data.get("letter") or self._letter_for_label(label_data.get("label"))
+            label_text = (label_text or "").strip()
+            if label_text:
+                font_size = max(10, int(self.display_cell * 0.11))
+                cx_label = i * self.display_cell + self.display_cell // 2
+                cy_label = (j + 1) * self.display_cell - 6
+                if existing_label_item:
+                    self.canvas.coords(existing_label_item, cx_label, cy_label)
+                    self.canvas.itemconfig(existing_label_item, text=label_text, font=("Arial", font_size, "bold"), fill="#000000")
+                else:
+                    self.tile_text_items[coord] = self.canvas.create_text(
+                        cx_label,
+                        cy_label,
+                        text=label_text,
+                        fill="#000000",
+                        font=("Arial", font_size, "bold"),
+                        anchor="s",
+                        justify="center"
+                    )
+        elif existing_label_item:
+            self.canvas.delete(existing_label_item)
+            self.tile_text_items.pop(coord, None)
 
     def _redraw_tiles(self):
         if not self.canvas or not self.tile_frames:
