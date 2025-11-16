@@ -230,12 +230,22 @@ class QuadGridNodesApp:
         self.bf_matcher = None
         self.orb_references: List[Dict[str, object]] = []
         self.color_references: List[Dict[str, object]] = []
+        self.terrain_template_image: Optional[Image.Image] = None
+        self.terrain_template_features: Optional[Tuple[List[cv2.KeyPoint], np.ndarray]] = None
+        self.terrain_status_label: Optional[tk.Label] = None
+        self.terrain_status_text: str = "Terrain non analysé"
+        self.terrain_status_color: str = "#bdc3c7"
+        self.terrain_match_valid: bool = False
+        self.detected_board_width_px: Optional[float] = None
+        self.detected_board_height_px: Optional[float] = None
+        self.detected_case_width_px: Optional[float] = None
 
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
         self.pixel_ratio = self._detect_pixel_ratio()
         self._initialize_debug_logger()
         self._initialize_orb_pipeline()
+        self._load_terrain_reference()
         self._load_color_reference_library()
 
         self.show_dofus_gate()
@@ -248,6 +258,7 @@ class QuadGridNodesApp:
         """Retire tout le contenu principal pour preparer une nouvelle vue."""
         for widget in self.root.winfo_children():
             widget.destroy()
+        self.terrain_status_label = None
 
     def _set_borderless(self, enabled: bool):
         if self._borderless == enabled:
@@ -560,6 +571,7 @@ class QuadGridNodesApp:
             )
 
         self._update_preview_image()
+        self._analyze_board_reference(getattr(self, "initial_img", None))
         if self.status is not None:
             self.status.config(text=f"Cible : '{self.target_window_title}'. Aperçu rafraîchi.")
 
@@ -608,6 +620,7 @@ class QuadGridNodesApp:
             self.reference_img = self.initial_img.copy()
         else:
             self.reference_img = None
+        self._analyze_board_reference(self.reference_img)
         return success
 
 
@@ -719,6 +732,14 @@ class QuadGridNodesApp:
         self._create_param_control(ctrl_frame, "n", "Lignes", step=1, minimum=1)
         self._create_param_control(ctrl_frame, "m", "Colonnes", step=1, minimum=1)
         self._create_param_control(ctrl_frame, "cell", "Taille (px)", step=10, minimum=30, maximum=600)
+
+        self.terrain_status_label = tk.Label(
+            self.root,
+            text=self.terrain_status_text,
+            font=("Arial", 10, "bold"),
+            fg=self.terrain_status_color
+        )
+        self.terrain_status_label.pack(pady=(0, 4))
 
         self.preview_label = tk.Label(self.root, bg="black")
         self.preview_label.pack(fill="both", expand=True)
@@ -908,14 +929,14 @@ class QuadGridNodesApp:
         def on_press(key):
             try:
                 if key == keyboard.Key.esc:
-                    self.on_quit()
+                    if self.mode == "capture":
+                        self.return_to_config_from_capture()
+                    else:
+                        self.on_quit()
                 elif key == keyboard.Key.space:
                     self.on_space()
                 elif key == keyboard.Key.f1:
                     self.on_f1()
-                elif hasattr(key, "char") and key.char and key.char.lower() == "r":
-                    if self.mode == "capture":
-                        self.return_to_config_from_capture()
             except: pass
         listener = keyboard.Listener(on_press=on_press)
         listener.daemon = True
@@ -1094,6 +1115,41 @@ class QuadGridNodesApp:
             })
         self._debug_log(lambda: f"[COLOR] Références chargées: {len(self.color_references)}")
 
+    def _load_terrain_reference(self):
+        self.terrain_template_image = None
+        self.terrain_template_features = None
+        terrain_dir = self.root_dir / "Ref_blop" / "terrain"
+        image_path = None
+        if terrain_dir.exists():
+            for candidate in ("terrain.png", "terrain2.png"):
+                path = terrain_dir / candidate
+                if path.exists():
+                    image_path = path
+                    break
+            if image_path is None:
+                png_files = sorted(terrain_dir.glob("*.png"))
+                if png_files:
+                    image_path = png_files[0]
+        if image_path is None or not image_path.exists():
+            self._debug_log("[TERRAIN] Aucune référence terrain trouvée.")
+            return
+        try:
+            with Image.open(image_path) as img:
+                template = img.convert("RGB")
+        except Exception as exc:
+            self._debug_log(lambda: f"[TERRAIN] Impossible de charger {image_path}: {exc}")
+            return
+        if not self.orb:
+            self._debug_log("[TERRAIN] ORB indisponible, impossible de préparer la référence terrain.")
+            return
+        kp, descriptors = self._compute_orb_features(template)
+        if descriptors is None or not kp:
+            self._debug_log(lambda: f"[TERRAIN] Référence terrain sans descripteurs valides ({image_path.name}).")
+            return
+        self.terrain_template_image = template
+        self.terrain_template_features = (kp, descriptors)
+        self._debug_log(lambda: f"[TERRAIN] Référence chargée: {image_path.name}")
+
     def _compute_reference_color_histogram(self, image: Image.Image):
         if image is None:
             return None
@@ -1136,20 +1192,26 @@ class QuadGridNodesApp:
             hist.fill(1.0 / COLOR_HIST_BINS)
         return hist
 
-    def _compute_orb_descriptors(self, image: Image.Image) -> Optional[np.ndarray]:
+    def _compute_orb_features(self, image: Image.Image):
         if not self.orb or image is None:
-            return None
+            return None, None
         try:
             rgb = image.convert("RGB")
             arr = np.array(rgb)
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-            _, descriptors = self.orb.detectAndCompute(gray, None)
-            if descriptors is None or len(descriptors) == 0:
-                return None
-            return descriptors
+            keypoints, descriptors = self.orb.detectAndCompute(gray, None)
+            if descriptors is None or len(descriptors) == 0 or not keypoints:
+                return None, None
+            return keypoints, descriptors
         except Exception as exc:
             self._debug_log(lambda: f"[ORB] Extraction impossible: {exc}")
+            return None, None
+
+    def _compute_orb_descriptors(self, image: Image.Image) -> Optional[np.ndarray]:
+        if not self.orb or image is None:
             return None
+        _, descriptors = self._compute_orb_features(image)
+        return descriptors
 
     def _orb_match_score(self, frame: Image.Image, reference):
         """Retourne un score de similarite ORB entre 0 et 1 (1 = meilleur match)."""
@@ -1378,6 +1440,125 @@ class QuadGridNodesApp:
             "score": best_score,
             "coverage": signature.get("coverage")
         }
+
+    def _match_terrain_template(self, capture_image: Image.Image):
+        if not self.terrain_template_image or not self.terrain_template_features:
+            return None
+        if not self.orb:
+            return None
+        capture_kp, capture_desc = self._compute_orb_features(capture_image)
+        if capture_desc is None or not capture_kp:
+            return None
+        template_kp, template_desc = self.terrain_template_features
+        if template_desc is None or not template_kp:
+            return None
+        matcher = self.bf_matcher or cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        try:
+            matches = matcher.match(template_desc, capture_desc)
+        except Exception as exc:
+            self._debug_log(lambda: f"[TERRAIN] BFMatcher erreur: {exc}")
+            return None
+        if not matches:
+            return None
+        matches = sorted(matches, key=lambda m: m.distance)
+        if len(matches) < 12:
+            score = len(matches) / 12.0
+            return {"valid": False, "score": max(0.0, min(1.0, score))}
+        pts_template = np.float32([template_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        pts_capture = np.float32([capture_kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        H, mask = cv2.findHomography(pts_template, pts_capture, cv2.RANSAC, 5.0)
+        if H is None:
+            return {"valid": False, "score": 0.0}
+        inlier_ratio = 0.0
+        if mask is not None and len(mask) > 0:
+            inlier_ratio = float(np.count_nonzero(mask)) / float(len(mask))
+        template_w, template_h = self.terrain_template_image.size
+        template_corners = np.float32([
+            [0, 0],
+            [template_w, 0],
+            [template_w, template_h],
+            [0, template_h]
+        ]).reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(template_corners, H).reshape(-1, 2)
+        def _edge_length(a, b):
+            return float(np.linalg.norm(a - b))
+        top_width = _edge_length(projected[0], projected[1])
+        bottom_width = _edge_length(projected[3], projected[2])
+        left_height = _edge_length(projected[0], projected[3])
+        right_height = _edge_length(projected[1], projected[2])
+        board_width = max(1.0, (top_width + bottom_width) * 0.5)
+        board_height = max(1.0, (left_height + right_height) * 0.5)
+        columns = max(1, int(self.m))
+        rows = max(1, int(self.n))
+        case_width = board_width / columns
+        case_height = board_height / rows
+        valid = inlier_ratio >= 0.3 and case_width > 0
+        return {
+            "valid": valid,
+            "score": max(0.0, min(1.0, inlier_ratio)),
+            "board_width": board_width,
+            "board_height": board_height,
+            "case_width": case_width,
+            "case_height": case_height
+        }
+
+    def _update_cell_from_board_measure(self):
+        if not self.detected_board_width_px:
+            return
+        columns = max(1, int(getattr(self, "m", 1)))
+        case_width = self.detected_board_width_px / columns
+        if case_width <= 0:
+            return
+        self.detected_case_width_px = case_width
+        new_cell_value = max(30, int(round(case_width * 2.0)))
+        if self.cell != new_cell_value:
+            self.cell = new_cell_value
+            self._refresh_param_label("cell")
+            if self.mode == "capture" and self.canvas:
+                self.update_canvas_size()
+            elif self.mode == "config":
+                self._update_preview_image()
+
+    def _update_terrain_status_label(self, text: str, color: str = "#f1c40f"):
+        self.terrain_status_text = text
+        self.terrain_status_color = color
+        if self.terrain_status_label:
+            self.terrain_status_label.config(text=text, fg=color)
+
+    def _analyze_board_reference(self, source_image: Optional[Image.Image] = None):
+        image = source_image or self.reference_img or getattr(self, "initial_img", None)
+        if image is None:
+            self.terrain_match_valid = False
+            self.detected_board_width_px = None
+            self.detected_board_height_px = None
+            self.detected_case_width_px = None
+            self._update_terrain_status_label("Terrain inconnu", "#f39c12")
+            return
+        result = self._match_terrain_template(image)
+        if not result:
+            self.terrain_match_valid = False
+            self.detected_board_width_px = None
+            self.detected_board_height_px = None
+            self.detected_case_width_px = None
+            self._update_terrain_status_label("Terrain incorrect", "#e74c3c")
+            return
+        if not result.get("valid"):
+            score = result.get("score", 0.0)
+            self.terrain_match_valid = False
+            self.detected_board_width_px = None
+            self.detected_board_height_px = None
+            self.detected_case_width_px = None
+            suffix = f" ({score * 100:.0f}%)" if score else ""
+            self._update_terrain_status_label(f"Terrain incorrect{suffix}", "#e74c3c")
+            return
+        self.terrain_match_valid = True
+        self.detected_board_width_px = result.get("board_width")
+        self.detected_board_height_px = result.get("board_height")
+        self.detected_case_width_px = result.get("case_width")
+        score = result.get("score", 0.0)
+        suffix = f" ({score * 100:.0f}%)" if score else ""
+        self._update_terrain_status_label(f"Terrain valide{suffix}", "#2ecc71")
+        self._update_cell_from_board_measure()
 
     def _select_most_different_frame(self, frames: List[Image.Image], monitor):
         """Choisit la frame retenue et calcule le vote blop correspondant."""
@@ -1638,6 +1819,8 @@ class QuadGridNodesApp:
         if new_value == current_value:
             return
         setattr(self, key, new_value)
+        if key == "m":
+            self._update_cell_from_board_measure()
         self.read_params()
         self._refresh_param_label(key)
         if key in ("n", "m"):
