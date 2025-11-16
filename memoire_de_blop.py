@@ -43,6 +43,13 @@ IS_WINDOWS = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
+
+class CompatibilityTestError(Exception):
+    def __init__(self, step: str, message: str, logs: Optional[List[str]] = None):
+        super().__init__(message)
+        self.step = step
+        self.logs = logs or []
+
 CONFIG = {
     "memory_window_ratio": 0.35,
     "capture_frames": 20,
@@ -240,6 +247,9 @@ class QuadGridNodesApp:
         self.detected_board_height_px: Optional[float] = None
         self.detected_case_width_px: Optional[float] = None
 
+        self.compat_test_button: Optional[tk.Button] = None
+        self._compat_test_running = False
+
         self.sct = mss.mss()
         self.vmon = self.sct.monitors[0]
         self.pixel_ratio = self._detect_pixel_ratio()
@@ -394,6 +404,7 @@ class QuadGridNodesApp:
     def _prepare_gate_frame(self):
         """Construit le conteneur principal de la porte Dofus."""
         self._clear_root_widgets()
+        self.compat_test_button = None
         gate_frame = tk.Frame(self.root, padx=20, pady=20)
         gate_frame.pack(fill="both", expand=True)
         return gate_frame
@@ -427,11 +438,166 @@ class QuadGridNodesApp:
             values=[entry["label"] for entry in self.dofus_entries]
         )
         combo.pack(fill="x", padx=10, pady=5)
+        self.compat_test_button = tk.Button(
+            parent,
+            text="Test compatibilité",
+            command=self.run_compatibility_test
+        )
+        self.compat_test_button.pack(pady=(5, 0))
 
         btn_frame = tk.Frame(parent)
         btn_frame.pack(pady=15)
         tk.Button(btn_frame, text="Valider", command=self.on_validate_dofus_selection).pack(side="left", padx=10)
         tk.Button(btn_frame, text="Fermer", command=self.on_quit).pack(side="right", padx=10)
+
+    def run_compatibility_test(self):
+        if self._compat_test_running:
+            messagebox.showinfo("Test compatibilité", "Un test est déjà en cours.")
+            return
+        self._compat_test_running = True
+        if self.compat_test_button:
+            self.compat_test_button.config(state="disabled", text="Test en cours…")
+        worker = threading.Thread(target=self._compatibility_test_worker, daemon=True)
+        worker.start()
+
+    def _compatibility_test_worker(self):
+        start_time = time.time()
+        try:
+            logs = self._perform_compatibility_checks()
+            duration = time.time() - start_time
+            logs.append(f"⏱️ Durée totale: {duration:.1f} s")
+            success = True
+            summary = "\n".join(logs)
+        except CompatibilityTestError as exc:
+            duration = time.time() - start_time
+            logs = list(exc.logs)
+            logs.append(f"❌ Étape «{exc.step}» : {exc}")
+            logs.append(f"⏱️ Interruption après {duration:.1f} s")
+            success = False
+            summary = "\n".join(logs)
+        except Exception as exc:
+            duration = time.time() - start_time
+            summary = f"Erreur inattendue: {exc}\n⏱️ Interruption après {duration:.1f} s"
+            success = False
+        self.root.after(0, lambda: self._finalize_compatibility_test(success, summary))
+
+    def _finalize_compatibility_test(self, success: bool, summary: str):
+        self._compat_test_running = False
+        if self.compat_test_button:
+            self.compat_test_button.config(state="normal", text="Test compatibilité")
+        if success:
+            messagebox.showinfo("Test compatibilité", summary)
+        else:
+            messagebox.showerror("Test compatibilité", summary)
+
+    def _perform_compatibility_checks(self) -> List[str]:
+        logs: List[str] = []
+        test_path = self.root_dir / "compatibility_probe.png"
+        terrain_path = self._find_terrain_reference_path()
+        if terrain_path is None or not terrain_path.exists():
+            raise CompatibilityTestError(
+                "Référence terrain",
+                "Impossible de trouver Ref_blop/terrain/terrain.png (ou équivalent).",
+                logs
+            )
+        try:
+            with Image.open(terrain_path) as ref_img:
+                test_image = ref_img.convert("RGB")
+        except Exception as exc:
+            raise CompatibilityTestError("Référence terrain", f"Lecture impossible: {exc}", logs)
+        logs.append(f"✅ Image terrain chargée ({terrain_path.name})")
+        try:
+            test_image.save(test_path)
+        except Exception as exc:
+            raise CompatibilityTestError("Écriture d'image", f"Sauvegarde impossible: {exc}", logs)
+        logs.append("✅ Image terrain sauvegardée pour test I/O")
+        try:
+            with Image.open(test_path) as handle:
+                loaded_image = handle.convert("RGB")
+        except Exception as exc:
+            raise CompatibilityTestError("Chargement d'image", f"Lecture impossible: {exc}", logs)
+        logs.append("✅ Image terrain rechargée via PIL")
+        hist = self._compute_reference_color_histogram(loaded_image)
+        if hist is None:
+            raise CompatibilityTestError("Histogramme", "Histogramme indisponible sur l'image de test.", logs)
+        logs.append("✅ Histogramme de couleur calculé")
+        kp, descriptors = self._compute_orb_features(loaded_image)
+        if kp is None or descriptors is None:
+            raise CompatibilityTestError("ORB", "Impossible d'extraire des points ORB (OpenCV).", logs)
+        logs.append(f"✅ ORB: {len(kp)} points détectés")
+        score = self._orb_match_score(loaded_image, loaded_image.copy())
+        if score is None:
+            raise CompatibilityTestError("BFMatcher", "Score ORB/BFMatcher indisponible.", logs)
+        logs.append(f"✅ BFMatcher ORB opérationnel ({score * 100:.0f} %)")
+        logs.append(self._try_sift_feature_detection(loaded_image, logs))
+        self._perform_mss_smoke_test(logs)
+        self._perform_listener_smoke_test(logs)
+        try:
+            test_image.save(test_path.with_name("compatibility_output.png"))
+            logs.append("✅ Export supplémentaire d'image réussi")
+        except Exception as exc:
+            raise CompatibilityTestError("Export d'image", f"Impossible d'écrire le fichier final: {exc}", logs)
+        finally:
+            for candidate in (test_path, test_path.with_name("compatibility_output.png")):
+                try:
+                    if candidate.exists():
+                        candidate.unlink()
+                except Exception:
+                    pass
+        return logs
+
+    def _try_sift_feature_detection(self, image: Image.Image, logs: List[str]) -> str:
+        sift_factory = getattr(cv2, "SIFT_create", None)
+        if sift_factory is None:
+            return "ℹ️ SIFT indisponible dans cette build OpenCV"
+        try:
+            sift = sift_factory()
+            arr = np.array(image.convert("RGB"))
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            keypoints, descriptors = sift.detectAndCompute(gray, None)
+        except Exception as exc:
+            raise CompatibilityTestError("SIFT", f"Initialisation/compute échoué: {exc}", logs)
+        if descriptors is None or not keypoints:
+            raise CompatibilityTestError("SIFT", "Aucun descripteur SIFT n'a été généré.", logs)
+        return f"✅ SIFT: {len(keypoints)} points détectés"
+
+    def _perform_mss_smoke_test(self, logs: List[str]):
+        try:
+            temp_sct = mss.mss()
+            try:
+                monitor = temp_sct.monitors[0]
+                grab = temp_sct.grab(monitor)
+                if grab.width <= 0 or grab.height <= 0:
+                    raise RuntimeError("Capture vide")
+            finally:
+                try:
+                    temp_sct.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            raise CompatibilityTestError("Capture écran (mss)", f"Impossible de capturer l'écran: {exc}", logs)
+        logs.append("✅ Capture d'écran (mss) réussie")
+
+    def _perform_listener_smoke_test(self, logs: List[str]):
+        def _start_stop(listener):
+            listener.start()
+            time.sleep(0.1)
+            listener.stop()
+            try:
+                listener.join(timeout=1.0)
+            except Exception:
+                pass
+        try:
+            mouse_listener = mouse.Listener(on_click=lambda *args: None)
+            _start_stop(mouse_listener)
+        except Exception as exc:
+            raise CompatibilityTestError("Listener souris", f"pynput.mouse.Listener indisponible: {exc}", logs)
+        try:
+            keyboard_listener = keyboard.Listener(on_press=lambda *args: None)
+            _start_stop(keyboard_listener)
+        except Exception as exc:
+            raise CompatibilityTestError("Listener clavier", f"pynput.keyboard.Listener indisponible: {exc}", logs)
+        logs.append("✅ Listeners Pynput (souris + clavier)")
 
     def _render_gate_retry_panel(self, parent):
         """Affiche les actions quand aucune fenetre n est detectee."""
@@ -1115,21 +1281,23 @@ class QuadGridNodesApp:
             })
         self._debug_log(lambda: f"[COLOR] Références chargées: {len(self.color_references)}")
 
+    def _find_terrain_reference_path(self) -> Optional[Path]:
+        terrain_dir = self.root_dir / "Ref_blop" / "terrain"
+        if not terrain_dir.exists():
+            return None
+        for candidate in ("terrain.png", "terrain2.png"):
+            path = terrain_dir / candidate
+            if path.exists():
+                return path
+        png_files = sorted(terrain_dir.glob("*.png"))
+        if png_files:
+            return png_files[0]
+        return None
+
     def _load_terrain_reference(self):
         self.terrain_template_image = None
         self.terrain_template_features = None
-        terrain_dir = self.root_dir / "Ref_blop" / "terrain"
-        image_path = None
-        if terrain_dir.exists():
-            for candidate in ("terrain.png", "terrain2.png"):
-                path = terrain_dir / candidate
-                if path.exists():
-                    image_path = path
-                    break
-            if image_path is None:
-                png_files = sorted(terrain_dir.glob("*.png"))
-                if png_files:
-                    image_path = png_files[0]
+        image_path = self._find_terrain_reference_path()
         if image_path is None or not image_path.exists():
             self._debug_log("[TERRAIN] Aucune référence terrain trouvée.")
             return

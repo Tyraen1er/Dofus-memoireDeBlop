@@ -30,6 +30,8 @@ python3 memoire_de_blop.py
   - Cliquez dans le jeu ; le programme associe automatiquement la tuile la plus proche et enregistre 10 images sur 2 s.
   - Les tuiles affichent ensuite en boucle la séquence enregistrée, et le panneau latéral montre une carte des clics.
 
+Au lancement, la sélection de la fenêtre “Release” affiche aussi un bouton **Test compatibilité** : il exécute un diagnostic rapide (lecture/écriture d’images, ORB/SIFT, histogramme, capture écran, listeners `pynput`, etc.) pour confirmer que les dépendances critiques fonctionnent bien sur votre machine.
+
 Raccourcis : `Échap` pour revenir au mode configuration pendant une capture (et quitter si vous êtes déjà en mode config), `Espace` pour définir les coins en mode config, `F1` pour lancer la capture.
 
 ## Compatibilité et limites selon l’OS
